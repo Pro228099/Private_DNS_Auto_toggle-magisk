@@ -1,0 +1,5 @@
+# Build output
+*.zip
+
+# Agent working state
+.openhands/
