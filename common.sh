@@ -15,8 +15,9 @@ LOG_FILE="${LOG_FILE:-/data/adb/private_dns_auto_toggle.log}"
 SETTINGS_BIN="${SETTINGS_BIN:-settings}"
 GETPROP_BIN="${GETPROP_BIN:-getprop}"
 DUMPSYS_BIN="${DUMPSYS_BIN:-dumpsys}"
+SYSFS_NET="${SYSFS_NET:-/sys/class/net}"
 
-# Last transport list seen by is_vpn_active (for logging/diagnostics).
+# Human-readable reason for the last is_vpn_active result (for logging).
 LAST_TRANSPORTS=""
 
 # Defaults (overridable from the config file).
@@ -48,22 +49,46 @@ settings_put() {
     "$SETTINGS_BIN" put "$1" "$2" "$3" >/dev/null 2>&1
 }
 
-# True when a connected network exposes the VPN transport.
-# NOTE: dumpsys connectivity prints "NOT_VPN" among the *capabilities* of every
-# network, so we must look only at the "Transports:" field (a single token such
-# as "WIFI&VPN"). Grepping the bare word VPN would match NOT_VPN -> false alarm.
+# True when a VPN tunnel is active. Two independent signals, either of which
+# counts; LOG shows which one matched.
+#
+# 1) sysfs: a tun/ppp/pptp/tap interface showing "up" means a VPN tunnel is
+#    active. This is the classic Android approach and is exact.
+# 2) dumpsys connectivity: the FIRST "Transports:" line belongs to the active
+#    default network, so if it lists VPN the tunnel is up. Note dumpsys prints
+#    "NOT_VPN" among the *capabilities* of every network, so we must look only
+#    at the Transports field, never grep the bare word VPN (that matches NOT_VPN).
 is_vpn_active() {
-    local dump transports
-    dump="$("$DUMPSYS_BIN" connectivity 2>/dev/null)" || true
-    [ -n "$dump" ] || return 1
-    transports="$(echo "$dump" | sed -n 's/.*Transports:[[:space:]]*\([^[:space:]]*\).*/\1/p' | tr '\n' ',')"
-    transports="${transports%,}"
-    LAST_TRANSPORTS="$transports"
-    [ -n "$transports" ] || return 1
-    case "$transports" in
-        *VPN*) return 0 ;;
-        *) return 1 ;;
+    local iface
+
+    if [ -d "$SYSFS_NET" ]; then
+        for iface in "$SYSFS_NET"/*; do
+            [ -e "$iface" ] || continue
+            iface="${iface##*/}"
+            case "$iface" in
+                tun[0-9]*|ppp[0-9]*|pptp[0-9]*|tap[0-9]*)
+                    case "$(cat "$SYSFS_NET/$iface/operstate" 2>/dev/null)" in
+                        up|unknown)
+                            LAST_TRANSPORTS="iface $iface up"
+                            return 0
+                            ;;
+                    esac
+                    ;;
+            esac
+        done
+    fi
+
+    local active
+    active="$("$DUMPSYS_BIN" connectivity 2>/dev/null \
+        | sed -n 's/.*Transports:[[:space:]]*\([^[:space:]]*\).*/\1/p' \
+        | head -n 1)"
+    LAST_TRANSPORTS="conn: ${active:-none}"
+    # Match VPN as a whole token (Transports uses '&' as separator). A plain
+    # *VPN* glob would also match "NOT_VPN", which must never count.
+    case "$active" in
+        VPN|VPN\&*|*\&VPN|*\&VPN\&*) return 0 ;;
     esac
+    return 1
 }
 
 save_state() {
