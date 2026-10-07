@@ -20,7 +20,7 @@ CHECK_INTERVAL=10
 AUTO_START=true
 RESTORE_ON_EXIT=true
 DNS_MODE=off
-LOG=false
+LOG=true
 DRY_RUN=false
 
 log_msg() {
@@ -67,13 +67,15 @@ save_state() {
 }
 
 # Only overwrite the saved state while Private DNS is actually enabled, so the
-# user's real preference survives across VPN connect/disconnect cycles.
+# user's real preference survives across VPN connect/disconnect cycles. Logs only
+# when the value changes, so the periodic refresh keeps the log small.
 save_state_if_enabled() {
-    local mode
+    local mode old
     mode="$(settings_get global private_dns_mode)"
     if [ "$mode" = "hostname" ] || [ "$mode" = "opportunistic" ]; then
+        old="$(grep -m1 '^mode=' "$STATE_FILE" 2>/dev/null | cut -d= -f2)"
         save_state
-        log_msg "Saved Private DNS state: mode=$mode"
+        [ "$old" = "$mode" ] || log_msg "Saved Private DNS state: mode=$mode"
     fi
 }
 

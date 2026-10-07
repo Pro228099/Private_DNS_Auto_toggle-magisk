@@ -33,7 +33,7 @@
 | `AUTO_START` | `true` | Запускать watcher автоматически при загрузке. |
 | `RESTORE_ON_EXIT` | `true` | Вернуть Private DNS при удалении модуля. |
 | `DNS_MODE` | `off` | Режим, который ставится при активном VPN (`off` / `opportunistic` / `hostname`). |
-| `LOG` | `false` | Писать лог в `/data/adb/private_dns_auto_toggle.log`. |
+| `LOG` | `true` | Писать лог в `/data/adb/private_dns_auto_toggle.log`. |
 | `DRY_RUN` | `false` | Только логировать, ничего не менять (для отладки). |
 
 После правки конфига перезагрузитесь либо выполните от root:
@@ -77,6 +77,28 @@ zip -r9 private_dns_auto_toggle.zip \
 * `customize.sh` — права доступа и миграция конфига при обновлении.
 
 Ключи настроек Android: `global/private_dns_mode` (`off` / `opportunistic` / `hostname`) и `global/private_dns_specifier`.
+
+## Если не работает
+
+1. Проверьте, что файлы модуля на месте:
+   ```sh
+   su -c 'ls /data/adb/modules/private_dns_auto_toggle'
+   ```
+   Там должны быть `service.sh`, `common.sh`, `action.sh`, `module.prop`.
+2. Посмотрите лог:
+   ```sh
+   su -c 'cat /data/adb/private_dns_auto_toggle.log'
+   ```
+   При включении VPN появляется строка `VPN active -> Private DNS disabled`, при выключении — `VPN inactive -> Private DNS restored`.
+3. Принудительно запустите разовую проверку (кнопка **Action** или):
+   ```sh
+   su -c 'sh /data/adb/modules/private_dns_auto_toggle/action.sh'
+   ```
+4. Проверьте, видит ли система VPN в принципе:
+   ```sh
+   su -c 'dumpsys connectivity | grep -m1 Transports'
+   ```
+   При активном VPN должно быть что-то вроде `Transports: WIFI&VPN`.
 
 ## Требования
 

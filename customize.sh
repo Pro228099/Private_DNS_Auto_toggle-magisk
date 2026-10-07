@@ -1,7 +1,8 @@
 #!/system/bin/sh
 # Magisk installer hook. Sets permissions and migrates config from an old install.
-
-SKIPUNZIP=1
+# NOTE: do NOT set SKIPUNZIP here — Magisk only extracts the module files when it
+# is unset (it extracts customize.sh alone, then the rest of the zip). With
+# SKIPUNZIP=1 service.sh/common.sh/module.prop would never be installed.
 
 if [ -f /data/adb/private_dns_auto_toggle.conf ]; then
     ui_print "- Keeping existing config: /data/adb/private_dns_auto_toggle.conf"
@@ -13,7 +14,6 @@ set_perm "$MODPATH/service.sh" 0 0 0755
 set_perm "$MODPATH/action.sh" 0 0 0755
 set_perm "$MODPATH/uninstall.sh" 0 0 0755
 set_perm "$MODPATH/common.sh" 0 0 0644
-set_perm "$MODPATH/META-INF/com/google/android/update-binary" 0 0 0755
 
 ui_print "- Private DNS Auto Toggle installed"
 ui_print "- Config: /data/adb/private_dns_auto_toggle.conf"
