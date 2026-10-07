@@ -11,8 +11,13 @@ LOG_FILE="${LOG_FILE:-/data/adb/private_dns_auto_toggle.log}"
 # Fallbacks for the first seconds after boot, before Magisk sets PATH.
 [ -x /system/bin/settings ] && SETTINGS_BIN=/system/bin/settings
 [ -x /system/bin/getprop ] && GETPROP_BIN=/system/bin/getprop
+[ -x /system/bin/dumpsys ] && DUMPSYS_BIN=/system/bin/dumpsys
 SETTINGS_BIN="${SETTINGS_BIN:-settings}"
 GETPROP_BIN="${GETPROP_BIN:-getprop}"
+DUMPSYS_BIN="${DUMPSYS_BIN:-dumpsys}"
+
+# Last transport list seen by is_vpn_active (for logging/diagnostics).
+LAST_TRANSPORTS=""
 
 # Defaults (overridable from the config file).
 INTERVAL=5
@@ -49,9 +54,11 @@ settings_put() {
 # as "WIFI&VPN"). Grepping the bare word VPN would match NOT_VPN -> false alarm.
 is_vpn_active() {
     local dump transports
-    dump="$(dumpsys connectivity 2>/dev/null)" || true
+    dump="$("$DUMPSYS_BIN" connectivity 2>/dev/null)" || true
     [ -n "$dump" ] || return 1
-    transports="$(echo "$dump" | sed -n 's/.*Transports:[[:space:]]*\([^[:space:]]*\).*/\1/p')"
+    transports="$(echo "$dump" | sed -n 's/.*Transports:[[:space:]]*\([^[:space:]]*\).*/\1/p' | tr '\n' ',')"
+    transports="${transports%,}"
+    LAST_TRANSPORTS="$transports"
     [ -n "$transports" ] || return 1
     case "$transports" in
         *VPN*) return 0 ;;
@@ -129,9 +136,11 @@ watch_loop() {
         fi
 
         if [ "$vpn" = true ] && [ "$was" = false ]; then
+            log_msg "VPN detected (Transports: $LAST_TRANSPORTS)"
             disable_dns
             was=true
         elif [ "$vpn" = false ] && [ "$was" = true ]; then
+            log_msg "VPN gone (Transports: $LAST_TRANSPORTS)"
             restore_dns
             was=false
         fi
@@ -171,11 +180,11 @@ stop_watcher() {
 # One-shot check used by action.sh (button in the Magisk app).
 run_once() {
     if is_vpn_active; then
-        echo "VPN: active"
+        echo "VPN: active (Transports: $LAST_TRANSPORTS)"
         disable_dns
         echo "Action: Private DNS -> $DNS_MODE"
     else
-        echo "VPN: inactive"
+        echo "VPN: inactive (Transports: $LAST_TRANSPORTS)"
         restore_dns
         echo "Action: Private DNS restored"
     fi
