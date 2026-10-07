@@ -1,20 +1,29 @@
 #!/system/bin/sh
-# Private DNS Auto Toggle — shared helpers, config and the toggle loop.
+# Private DNS Auto Toggle — shared helpers, config and the toggle watcher.
 # Sourced by service.sh and action.sh. Kept POSIX-sh clean (mksh on Android).
 
 MODDIR="${MODDIR:-/data/adb/modules/private_dns_auto_toggle}"
 CONF_FILE="${CONF_FILE:-/data/adb/private_dns_auto_toggle.conf}"
 STATE_FILE="${STATE_FILE:-/data/adb/private_dns_auto_toggle.state}"
+FLAG_FILE="${FLAG_FILE:-/data/adb/private_dns_auto_toggle.vpn}"
 PID_FILE="${PID_FILE:-/data/adb/private_dns_auto_toggle.pid}"
+LOGCAT_PID_FILE="${LOGCAT_PID_FILE:-/data/adb/private_dns_auto_toggle.logcat.pid}"
+FIFO_FILE="${FIFO_FILE:-/data/adb/private_dns_auto_toggle.fifo}"
 LOG_FILE="${LOG_FILE:-/data/adb/private_dns_auto_toggle.log}"
 
-# Fallbacks for the first seconds after boot, before Magisk sets PATH.
+# Absolute paths: PATH may be empty for the first seconds after boot.
 [ -x /system/bin/settings ] && SETTINGS_BIN=/system/bin/settings
 [ -x /system/bin/getprop ] && GETPROP_BIN=/system/bin/getprop
 [ -x /system/bin/dumpsys ] && DUMPSYS_BIN=/system/bin/dumpsys
+[ -x /system/bin/logcat ] && LOGCAT_BIN=/system/bin/logcat
+[ -x /system/bin/sleep ] && SLEEP_BIN=/system/bin/sleep
+[ -x /system/bin/mkfifo ] && MKFIFO_BIN=/system/bin/mkfifo
 SETTINGS_BIN="${SETTINGS_BIN:-settings}"
 GETPROP_BIN="${GETPROP_BIN:-getprop}"
 DUMPSYS_BIN="${DUMPSYS_BIN:-dumpsys}"
+LOGCAT_BIN="${LOGCAT_BIN:-logcat}"
+SLEEP_BIN="${SLEEP_BIN:-sleep}"
+MKFIFO_BIN="${MKFIFO_BIN:-mkfifo}"
 SYSFS_NET="${SYSFS_NET:-/sys/class/net}"
 
 # Human-readable reason for the last is_vpn_active result (for logging).
@@ -22,7 +31,10 @@ LAST_TRANSPORTS=""
 
 # Defaults (overridable from the config file).
 INTERVAL=5
+POLL_INTERVAL=15
 CHECK_INTERVAL=10
+SETTLE=1
+EVENT_MODE=true
 AUTO_START=true
 RESTORE_ON_EXIT=true
 DNS_MODE=off
@@ -50,7 +62,7 @@ settings_put() {
 }
 
 # True when a VPN tunnel is active. Two independent signals, either of which
-# counts; LOG shows which one matched.
+# counts; LAST_TRANSPORTS shows which one matched.
 #
 # 1) sysfs: a tun/ppp/pptp/tap interface showing "up" means a VPN tunnel is
 #    active. This is the classic Android approach and is exact.
@@ -100,7 +112,7 @@ save_state() {
 
 # Only overwrite the saved state while Private DNS is actually enabled, so the
 # user's real preference survives across VPN connect/disconnect cycles. Logs only
-# when the value changes, so the periodic refresh keeps the log small.
+# when the value changes.
 save_state_if_enabled() {
     local mode old
     mode="$(settings_get global private_dns_mode)"
@@ -147,52 +159,124 @@ restore_dns() {
     log_msg "VPN inactive -> Private DNS restored (mode=$mode specifier=$specifier)"
 }
 
-# Long-running watcher started by service.sh. Uses the last-writer-wins pid
-# file so only one instance ever runs, even across module reinstalls.
-watch_loop() {
-    local vpn was=false first=true
+# Bring Private DNS in line with the *actual* VPN state. Idempotent: a presence
+# flag records whether this module currently holds the setting disabled, so a
+# missed or duplicated event can never double-toggle. Callers pass a short label
+# for the log ("startup", "event", "poll").
+reconcile() {
+    if is_vpn_active; then
+        [ -f "$FLAG_FILE" ] && return 0
+        log_msg "VPN detected ($1; $LAST_TRANSPORTS)"
+        disable_dns
+        : > "$FLAG_FILE"
+    else
+        [ -f "$FLAG_FILE" ] || return 0
+        log_msg "VPN gone ($1; $LAST_TRANSPORTS)"
+        restore_dns
+        rm -f "$FLAG_FILE"
+    fi
+}
 
-    save_state_if_enabled
+# True for the log lines the framework emits on every VPN state change. AOSP's
+# Vpn.java keeps LOGD=true on Android 11-15, so "setting state=..." is always
+# printed with tag "Vpn"; "Established by" is the INFO line on connect.
+is_vpn_event() {
+    case "$1" in
+        *"state=CONNECTED"*|*"state=DISCONNECTED"*|*"state=FAILED"*|*"Established by"*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# Event-driven watcher: follows the "Vpn" log tag instead of polling, so the
+# module costs nothing while idle. Falls back to plain polling if logcat is
+# missing or the stream dies.
+event_loop() {
+    local line lpid i
+    if [ ! -x "$LOGCAT_BIN" ] && ! command -v "$LOGCAT_BIN" >/dev/null 2>&1; then
+        log_msg "ERROR: logcat not found; using polling"
+        poll_loop
+        return
+    fi
+    # Probe once: if logcat cannot read the Vpn tag there is no point streaming.
+    if ! "$LOGCAT_BIN" -d -s Vpn >/dev/null 2>&1; then
+        log_msg "ERROR: logcat unusable; using polling"
+        poll_loop
+        return
+    fi
+    rm -f "$FIFO_FILE"
+    "$MKFIFO_BIN" "$FIFO_FILE" 2>/dev/null || {
+        log_msg "ERROR: cannot create fifo; using polling"
+        poll_loop
+        return
+    }
+    log_msg "Event mode: watching 'logcat -s Vpn'"
 
     while true; do
-        vpn=false
-        if is_vpn_active; then
-            vpn=true
-        fi
+        "$LOGCAT_BIN" -s Vpn > "$FIFO_FILE" 2>/dev/null &
+        lpid=$!
+        echo "$lpid" > "$LOGCAT_PID_FILE"
+        while IFS= read -r line; do
+            if is_vpn_event "$line"; then
+                log_msg "Event: $line"
+                "$SLEEP_BIN" "$SETTLE"
+                reconcile "event"
+            fi
+        done < "$FIFO_FILE"
+        kill "$lpid" 2>/dev/null
+        rm -f "$LOGCAT_PID_FILE"
 
-        if [ "$vpn" = true ] && [ "$was" = false ]; then
-            log_msg "VPN detected (Transports: $LAST_TRANSPORTS)"
-            disable_dns
-            was=true
-        elif [ "$vpn" = false ] && [ "$was" = true ]; then
-            log_msg "VPN gone (Transports: $LAST_TRANSPORTS)"
-            restore_dns
-            was=false
-        fi
-
-        # While idle, keep the saved state fresh so a Private DNS change made by
-        # the user (or a VPN policy) is respected on the next connect. Do NOT do
-        # this on the first iteration: right after boot the setting may still be
-        # "off" from a previous session, which would overwrite the real value.
-        if [ "$first" = false ] && [ "$vpn" = false ]; then
-            save_state_if_enabled
-        fi
-        first=false
-
-        sleep "$INTERVAL"
+        # logcat ended (logd restart, toybox hiccup): poll for a while, then retry.
+        log_msg "Event stream ended; polling every ${POLL_INTERVAL}s"
+        i=0
+        while [ "$i" -lt 20 ]; do
+            "$SLEEP_BIN" "$POLL_INTERVAL"
+            reconcile "poll"
+            i=$((i + 1))
+        done
+        log_msg "Retrying event stream"
     done
+}
+
+# Plain timer watcher, used when EVENT_MODE=false.
+poll_loop() {
+    while true; do
+        reconcile "poll"
+        "$SLEEP_BIN" "$INTERVAL"
+    done
+}
+
+# Entry point run in the background by service.sh.
+watch_main() {
+    save_state_if_enabled
+    # The flag survives in /data across a reboot, but Android resets Private DNS
+    # on boot, so drop it and let the startup reconcile decide from scratch.
+    rm -f "$FLAG_FILE"
+    # Reconcile once up front: a VPN may already be up when we start.
+    reconcile "startup"
+    if [ "$EVENT_MODE" = true ]; then
+        event_loop
+    else
+        poll_loop
+    fi
 }
 
 # Start the watcher in the background, killing any previous instance first.
 start_watcher() {
     stop_watcher
-    ( watch_loop ) >/dev/null 2>&1 &
+    ( watch_main ) >/dev/null 2>&1 &
     echo "$!" > "$PID_FILE"
-    log_msg "Watcher started (pid=$(cat "$PID_FILE" 2>/dev/null))"
+    log_msg "Watcher started (pid=$(cat "$PID_FILE" 2>/dev/null), event_mode=$EVENT_MODE)"
 }
 
 stop_watcher() {
     local pid
+    if [ -f "$LOGCAT_PID_FILE" ]; then
+        pid="$(cat "$LOGCAT_PID_FILE" 2>/dev/null)"
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+        rm -f "$LOGCAT_PID_FILE"
+    fi
     if [ -f "$PID_FILE" ]; then
         pid="$(cat "$PID_FILE" 2>/dev/null)"
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -200,6 +284,7 @@ stop_watcher() {
         fi
         rm -f "$PID_FILE"
     fi
+    rm -f "$FIFO_FILE"
 }
 
 # One-shot check used by action.sh (button in the Magisk app).
