@@ -7,6 +7,7 @@ CONF_FILE="${CONF_FILE:-/data/adb/private_dns_auto_toggle.conf}"
 STATE_FILE="${STATE_FILE:-/data/adb/private_dns_auto_toggle.state}"
 FLAG_FILE="${FLAG_FILE:-/data/adb/private_dns_auto_toggle.vpn}"
 PID_FILE="${PID_FILE:-/data/adb/private_dns_auto_toggle.pid}"
+SAFETY_PID_FILE="${SAFETY_PID_FILE:-/data/adb/private_dns_auto_toggle.safety.pid}"
 LOGCAT_PID_FILE="${LOGCAT_PID_FILE:-/data/adb/private_dns_auto_toggle.logcat.pid}"
 FIFO_FILE="${FIFO_FILE:-/data/adb/private_dns_auto_toggle.fifo}"
 LOG_FILE="${LOG_FILE:-/data/adb/private_dns_auto_toggle.log}"
@@ -31,7 +32,7 @@ LAST_TRANSPORTS=""
 
 # Defaults (overridable from the config file).
 INTERVAL=5
-POLL_INTERVAL=15
+POLL_INTERVAL=30
 CHECK_INTERVAL=10
 SETTLE=1
 EVENT_MODE=true
@@ -189,11 +190,15 @@ is_vpn_event() {
     return 1
 }
 
-# Event-driven watcher: follows the "Vpn" log tag instead of polling, so the
-# module costs nothing while idle. Falls back to plain polling if logcat is
-# missing or the stream dies.
+# Event-driven watcher: follows the "Vpn" log tag so connect/disconnect are
+# handled instantly. A concurrent slow poll runs alongside it because a logcat
+# stream is not always trustworthy: on Android <= 12 logcat block-buffers when
+# its stdout is a pipe/FIFO (the per-message fflush only arrived in Android 13),
+# so a low-traffic tag like "Vpn" can leave the stream silent for a very long
+# time. The poll is the safety net; because reconcile() is idempotent, it stays
+# silent while the events are doing their job.
 event_loop() {
-    local line lpid i
+    local line lpid probe
     if [ ! -x "$LOGCAT_BIN" ] && ! command -v "$LOGCAT_BIN" >/dev/null 2>&1; then
         log_msg "ERROR: logcat not found; using polling"
         poll_loop
@@ -205,14 +210,23 @@ event_loop() {
         poll_loop
         return
     fi
+    # Diagnostic: how many "Vpn" lines logcat can see. Zero is fine (no VPN has
+    # been used since boot), but it tells us at a glance whether the tag is
+    # reachable in this context.
+    probe="$("$LOGCAT_BIN" -d -s Vpn 2>/dev/null | wc -l)"
+    log_msg "Event probe: logcat sees ${probe:-0} 'Vpn' line(s)"
     rm -f "$FIFO_FILE"
     "$MKFIFO_BIN" "$FIFO_FILE" 2>/dev/null || {
         log_msg "ERROR: cannot create fifo; using polling"
         poll_loop
         return
     }
-    log_msg "Event mode: watching 'logcat -s Vpn'"
+    log_msg "Event mode: watching 'logcat -s Vpn' (safety poll every ${POLL_INTERVAL}s)"
 
+    ( safety_loop ) >/dev/null 2>&1 &
+    echo "$!" > "$SAFETY_PID_FILE"
+
+    # Restart the stream if logcat ever exits (logd restart, toybox hiccup).
     while true; do
         "$LOGCAT_BIN" -s Vpn > "$FIFO_FILE" 2>/dev/null &
         lpid=$!
@@ -224,18 +238,22 @@ event_loop() {
                 reconcile "event"
             fi
         done < "$FIFO_FILE"
-        kill "$lpid" 2>/dev/null
+        kill -9 "$lpid" 2>/dev/null
+        wait "$lpid" 2>/dev/null
         rm -f "$LOGCAT_PID_FILE"
+        log_msg "Event stream ended; retrying in ${POLL_INTERVAL}s"
+        "$SLEEP_BIN" "$POLL_INTERVAL"
+    done
+}
 
-        # logcat ended (logd restart, toybox hiccup): poll for a while, then retry.
-        log_msg "Event stream ended; polling every ${POLL_INTERVAL}s"
-        i=0
-        while [ "$i" -lt 20 ]; do
-            "$SLEEP_BIN" "$POLL_INTERVAL"
-            reconcile "poll"
-            i=$((i + 1))
-        done
-        log_msg "Retrying event stream"
+# Slow safety poll: reconciles state so a silent/dead event stream can never
+# leave the module stuck. Logs nothing unless the state actually changes. It
+# exits by itself once the watcher tears the fifo down.
+safety_loop() {
+    while [ -p "$FIFO_FILE" ]; do
+        "$SLEEP_BIN" "$POLL_INTERVAL"
+        [ -p "$FIFO_FILE" ] || break
+        reconcile "safety"
     done
 }
 
@@ -270,6 +288,10 @@ start_watcher() {
     log_msg "Watcher started (pid=$(cat "$PID_FILE" 2>/dev/null), event_mode=$EVENT_MODE)"
 }
 
+# SIGKILL, not SIGTERM: mksh (Android's /system/bin/sh) does not terminate a
+# backgrounded subshell that is looping on SIGTERM, only on SIGKILL. Without
+# this a restart would leak watcher processes and uninstall would leave the
+# module toggling DNS forever.
 stop_watcher() {
     local pid
     if [ -f "$LOGCAT_PID_FILE" ]; then
@@ -277,11 +299,14 @@ stop_watcher() {
         [ -n "$pid" ] && kill "$pid" 2>/dev/null
         rm -f "$LOGCAT_PID_FILE"
     fi
+    if [ -f "$SAFETY_PID_FILE" ]; then
+        pid="$(cat "$SAFETY_PID_FILE" 2>/dev/null)"
+        [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
+        rm -f "$SAFETY_PID_FILE"
+    fi
     if [ -f "$PID_FILE" ]; then
         pid="$(cat "$PID_FILE" 2>/dev/null)"
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null
-        fi
+        [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
         rm -f "$PID_FILE"
     fi
     rm -f "$FIFO_FILE"
