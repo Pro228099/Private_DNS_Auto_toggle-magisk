@@ -26,8 +26,10 @@ done
 # Extra settle time for ConnectivityService to report the first default network.
 sleep "$CHECK_INTERVAL"
 
-if ! command -v settings >/dev/null 2>&1; then
-    log_msg "ERROR: 'settings' binary not found; cannot toggle Private DNS"
+if [ -x "$SETTINGS_BIN" ]; then
+    log_msg "Startup: settings=$SETTINGS_BIN private_dns_mode=$(settings_get global private_dns_mode) specifier=$(settings_get global private_dns_specifier)"
+else
+    log_msg "ERROR: 'settings' binary not found at $SETTINGS_BIN; cannot toggle Private DNS"
 fi
 
 if [ "$AUTO_START" = true ]; then

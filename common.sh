@@ -2,6 +2,12 @@
 # Private DNS Auto Toggle — shared helpers, config and the toggle watcher.
 # Sourced by service.sh and action.sh. Kept POSIX-sh clean (mksh on Android).
 
+# A service started at boot can inherit a near-empty PATH, which would make plain
+# sed/grep/cat/date calls fail and silently break VPN detection. Coreutils live
+# in /system/bin, so guarantee they resolve.
+PATH="/system/bin:/system/xbin:/vendor/bin:${PATH:-/sbin:/su/bin}"
+export PATH
+
 MODDIR="${MODDIR:-/data/adb/modules/private_dns_auto_toggle}"
 CONF_FILE="${CONF_FILE:-/data/adb/private_dns_auto_toggle.conf}"
 STATE_FILE="${STATE_FILE:-/data/adb/private_dns_auto_toggle.state}"
@@ -58,31 +64,48 @@ settings_get() {
     "$SETTINGS_BIN" get "$1" "$2" 2>/dev/null | tr -d '\r'
 }
 
+# Write a setting and verify it stuck. `settings put` can fail silently (SELinux
+# denial on some ROMs, provider not ready right after boot), which used to make
+# the log claim success while Private DNS never actually changed. Retry once and
+# report truthfully via the return code.
 settings_put() {
-    "$SETTINGS_BIN" put "$1" "$2" "$3" >/dev/null 2>&1
+    local tries=0
+    while [ "$tries" -lt 2 ]; do
+        "$SETTINGS_BIN" put "$1" "$2" "$3" >/dev/null 2>&1
+        [ "$(settings_get "$1" "$2")" = "$3" ] && return 0
+        tries=$((tries + 1))
+        [ "$tries" -lt 2 ] && "$SLEEP_BIN" 1
+    done
+    return 1
 }
 
-# True when a VPN tunnel is active. Two independent signals, either of which
-# counts; LAST_TRANSPORTS shows which one matched.
+# True when a VPN tunnel is active. Three independent signals, any of which
+# counts; LAST_TRANSPORTS says which one matched.
 #
-# 1) sysfs: a tun/ppp/pptp/tap interface showing "up" means a VPN tunnel is
-#    active. This is the classic Android approach and is exact.
-# 2) dumpsys connectivity: the FIRST "Transports:" line belongs to the active
-#    default network, so if it lists VPN the tunnel is up. Note dumpsys prints
-#    "NOT_VPN" among the *capabilities* of every network, so we must look only
-#    at the Transports field, never grep the bare word VPN (that matches NOT_VPN).
+# 1) sysfs: the presence of a tun/ppp/pptp/tap/wg/ipsec interface means a
+#    VpnService tunnel is up (these interfaces only exist while it is). We do not
+#    require operstate=up because some kernels report "unknown".
+# 2) dumpsys connectivity: scan EVERY "Transports:" line, not just the first. On
+#    Android 12+ the listing prints each network, and the active default network
+#    can still be the underlying WiFi/CELL with the VPN in a separate block, so
+#    looking at the first line alone misses the tunnel (this was the bug: Private
+#    DNS stayed on while a VPN was connected). We only ever match tokens inside a
+#    Transports field, so the "NOT_VPN" capability of ordinary networks can never
+#    count.
+# 3) dumpsys fallback: a "NetworkAgentInfo [VPN ...]" block also proves a tunnel.
 is_vpn_active() {
-    local iface
+    local iface oper
 
     if [ -d "$SYSFS_NET" ]; then
         for iface in "$SYSFS_NET"/*; do
             [ -e "$iface" ] || continue
             iface="${iface##*/}"
             case "$iface" in
-                tun[0-9]*|ppp[0-9]*|pptp[0-9]*|tap[0-9]*)
-                    case "$(cat "$SYSFS_NET/$iface/operstate" 2>/dev/null)" in
-                        up|unknown)
-                            LAST_TRANSPORTS="iface $iface up"
+                tun[0-9]*|ppp[0-9]*|pptp[0-9]*|tap[0-9]*|wg[0-9]*|ipsec[0-9]*|vpn[0-9]*)
+                    oper="$(cat "$SYSFS_NET/$iface/operstate" 2>/dev/null)"
+                    case "$oper" in
+                        up|unknown|"") 
+                            LAST_TRANSPORTS="iface $iface ${oper:-present}"
                             return 0
                             ;;
                     esac
@@ -91,16 +114,29 @@ is_vpn_active() {
         done
     fi
 
-    local active
-    active="$("$DUMPSYS_BIN" connectivity 2>/dev/null \
-        | sed -n 's/.*Transports:[[:space:]]*\([^[:space:]]*\).*/\1/p' \
-        | head -n 1)"
+    local dump transports active
+    dump="$("$DUMPSYS_BIN" connectivity 2>/dev/null)"
+
+    # All Transports fields, one per line; the VPN token is an '&'-separated part.
+    transports="$(printf '%s\n' "$dump" \
+        | sed -n 's/.*Transports:[[:space:]]*\([^[:space:]]*\).*/\1/p')"
+    for active in $transports; do
+        case "$active" in
+            VPN|VPN\&*|*\&VPN|*\&VPN\&*)
+                LAST_TRANSPORTS="transports: $active"
+                return 0
+                ;;
+        esac
+    done
+
+    # Fallback: an explicit VPN NetworkAgentInfo block.
+    if printf '%s\n' "$dump" | grep -q 'NetworkAgentInfo \[VPN'; then
+        LAST_TRANSPORTS="agent: VPN"
+        return 0
+    fi
+
+    active="$(printf '%s\n' "$transports" | head -n 1)"
     LAST_TRANSPORTS="conn: ${active:-none}"
-    # Match VPN as a whole token (Transports uses '&' as separator). A plain
-    # *VPN* glob would also match "NOT_VPN", which must never count.
-    case "$active" in
-        VPN|VPN\&*|*\&VPN|*\&VPN\&*) return 0 ;;
-    esac
     return 1
 }
 
@@ -130,8 +166,12 @@ disable_dns() {
         return 0
     fi
     save_state_if_enabled
-    settings_put global private_dns_mode "$DNS_MODE"
-    log_msg "VPN active -> Private DNS disabled (private_dns_mode=$DNS_MODE)"
+    if settings_put global private_dns_mode "$DNS_MODE"; then
+        log_msg "VPN active -> Private DNS disabled (private_dns_mode=$DNS_MODE)"
+        return 0
+    fi
+    log_msg "ERROR: failed to set private_dns_mode=$DNS_MODE (settings put rejected); will retry"
+    return 1
 }
 
 # Restore the saved mode/specifier. If nothing was ever saved, do nothing so we
@@ -153,11 +193,15 @@ restore_dns() {
         log_msg "DRY-RUN: would restore private_dns_mode=$mode specifier=$specifier"
         return 0
     fi
-    settings_put global private_dns_mode "$mode"
+    if ! settings_put global private_dns_mode "$mode"; then
+        log_msg "ERROR: failed to restore private_dns_mode=$mode (settings put rejected); will retry"
+        return 1
+    fi
     if [ "$mode" = "hostname" ] && [ -n "$specifier" ]; then
         settings_put global private_dns_specifier "$specifier"
     fi
     log_msg "VPN inactive -> Private DNS restored (mode=$mode specifier=$specifier)"
+    return 0
 }
 
 # Bring Private DNS in line with the *actual* VPN state. Idempotent: a presence
@@ -168,13 +212,13 @@ reconcile() {
     if is_vpn_active; then
         [ -f "$FLAG_FILE" ] && return 0
         log_msg "VPN detected ($1; $LAST_TRANSPORTS)"
-        disable_dns
-        : > "$FLAG_FILE"
+        # Only record the flag once the write actually took effect. Otherwise the
+        # next safety poll retries instead of believing the job is done.
+        disable_dns && : > "$FLAG_FILE"
     else
         [ -f "$FLAG_FILE" ] || return 0
         log_msg "VPN gone ($1; $LAST_TRANSPORTS)"
-        restore_dns
-        rm -f "$FLAG_FILE"
+        restore_dns && rm -f "$FLAG_FILE"
     fi
 }
 
@@ -312,15 +356,24 @@ stop_watcher() {
     rm -f "$FIFO_FILE"
 }
 
-# One-shot check used by action.sh (button in the Magisk app).
+# One-shot check used by action.sh (button in the Magisk app). Prints enough
+# detail to diagnose why nothing changes on a given device.
 run_once() {
+    local cur cur_spec
+    cur="$(settings_get global private_dns_mode)"
+    cur_spec="$(settings_get global private_dns_specifier)"
+    echo "settings binary: $SETTINGS_BIN [$([ -x "$SETTINGS_BIN" ] && echo ok || echo missing)]"
+    echo "current: private_dns_mode=${cur:-<empty>} specifier=${cur_spec:-<empty>}"
     if is_vpn_active; then
-        echo "VPN: active (Transports: $LAST_TRANSPORTS)"
-        disable_dns
-        echo "Action: Private DNS -> $DNS_MODE"
+        echo "VPN: active (${LAST_TRANSPORTS})"
+        if disable_dns; then
+            echo "Action: Private DNS -> $(settings_get global private_dns_mode)"
+        else
+            echo "Action: FAILED to change Private DNS (see $LOG_FILE)"
+        fi
     else
-        echo "VPN: inactive (Transports: $LAST_TRANSPORTS)"
+        echo "VPN: inactive (${LAST_TRANSPORTS})"
         restore_dns
-        echo "Action: Private DNS restored"
+        echo "Action: Private DNS now $(settings_get global private_dns_mode)"
     fi
 }
