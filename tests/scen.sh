@@ -4,7 +4,7 @@
 HERE=$(cd "$(dirname "$0")" && pwd)
 MOD=${MOD:-$(cd "$HERE/.." && pwd)}
 N=$1; ROOT=$2; BIN=$ROOT/bin
-mkdir -p "$ROOT/settings" "$ROOT/net" "$BIN"
+mkdir -p "$ROOT/settings" "$ROOT/net" "$BIN" "$ROOT/mod"
 
 cat > "$BIN/settings" <<'EOF'
 #!/bin/sh
@@ -71,6 +71,10 @@ elif [ "$N" = 8 ] || [ "$N" = 9 ]; then
   printf 'EVENT_MODE=true\nINTERVAL=5\nPOLL_INTERVAL=60\nPOLL_INTERVAL_ACTIVE=60\nSETTLE=1\nEVENT_WAIT=3\nLOG=true\n' > "$ROOT/conf"
 elif [ "$N" = 10 ] || [ "$N" = 11 ]; then
   printf 'EVENT_MODE=false\nINTERVAL=1\nPOLL_INTERVAL=1\nLOG=true\n' > "$ROOT/conf"
+elif [ "$N" = 12 ]; then
+  printf 'EVENT_MODE=true\nINTERVAL=5\nPOLL_INTERVAL=2\nSETTLE=0\nLOG=true\n' > "$ROOT/conf"
+elif [ "$N" = 13 ]; then
+  printf 'EVENT_MODE=true\nINTERVAL=5\nPOLL_INTERVAL=1\nPOLL_INTERVAL_ACTIVE=1\nSETTLE=0\nLOG=true\n' > "$ROOT/conf"
 else
   case "$N" in
     1|4|5|7) POLL=15 ;;
@@ -88,7 +92,8 @@ export SLEEP_BIN=/bin/sleep MKFIFO_BIN=/usr/bin/mkfifo SYSFS_NET=$ROOT/net NETDE
 export DUMPSYS_SEQ=$ROOT/seq
 export CONF_FILE=$ROOT/conf STATE_FILE=$ROOT/state FLAG_FILE=$ROOT/vpn.flag
 export PID_FILE=$ROOT/pid LOGCAT_PID_FILE=$ROOT/logcat.pid SAFETY_PID_FILE=$ROOT/safety.pid
-export FIFO_FILE=$ROOT/fifo LOG_FILE=$ROOT/log
+export FIFO_FILE=$ROOT/fifo LOG_FILE=$ROOT/log HEARTBEAT_FILE=$ROOT/heartbeat
+export MODDIR=$ROOT/mod
 
 . "$MOD/common.sh"
 load_config
@@ -151,7 +156,8 @@ case "$N" in
   echo "WIFI&VPN" > "$TRANSPORT_FILE"
   : > "$FLAG_FILE"
   start_watcher; /bin/sleep 2
-  wait_for "VPN detected (startup" 30 && ok "startup reconcile detected VPN" || { no "startup reconcile"; cat "$LOG_FILE"; }
+  # Either wording is fine: a fresh detection or a re-assert over a stale flag.
+  wait_for "(startup" 30 && ok "startup reconcile detected VPN" || { no "startup reconcile"; cat "$LOG_FILE"; }
   [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = off ] && ok "mode off after reboot with VPN" || no "mode should be off"
   stop_watcher
   ;;
@@ -228,6 +234,37 @@ case "$N" in
   wait_for "still active on recheck" 30 && ok "flaky no-VPN read was rejected" || { no "no recheck"; cat "$LOG_FILE"; }
   [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = off ] && ok "mode stayed off through the flap" || no "mode should stay off"
   [ -f "$FLAG_FILE" ] && ok "flag kept while VPN really up" || no "flag should be kept"
+  stop_watcher
+  ;;
+12)
+  # The reported bug: a stale flag (left over from an older version, or set while
+  # the user had DNS off) makes every automatic check a no-op even though Private
+  # DNS is actually ON. reconcile must re-assert instead of trusting the flag.
+  export LOGCAT_BIN=$BIN/logcat
+  echo "WIFI&VPN" > "$TRANSPORT_FILE"
+  : > "$FLAG_FILE"                     # stale flag, but mode is hostname (on)
+  start_watcher; /bin/sleep 1
+  wait_for "changed externally while VPN up" 30 && ok "stale flag detected" || { no "stale flag not detected"; cat "$LOG_FILE"; }
+  wait_for "VPN active -> Private DNS disabled" 30 && ok "re-asserted DNS off" || { no "not re-asserted"; cat "$LOG_FILE"; }
+  [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = off ] && ok "mode off despite stale flag" || no "mode should be off"
+  stop_watcher
+  ;;
+13)
+  # Supervisor: if the watcher dies, the resident supervisor brings it back, so
+  # the toggle keeps working without a reboot.
+  export LOGCAT_BIN=$BIN/logcat
+  ( supervise_watcher ) >/dev/null 2>&1 &
+  sup=$!
+  /bin/sleep 1
+  first=$(cat "$PID_FILE" 2>/dev/null)
+  [ -n "$first" ] && ok "supervisor started a watcher" || no "no watcher started"
+  kill -9 "$first" 2>/dev/null
+  /bin/sleep 4
+  second=$(cat "$PID_FILE" 2>/dev/null)
+  [ -n "$second" ] && [ "$second" != "$first" ] && ok "supervisor restarted the dead watcher" || no "watcher not restarted (was $first now $second)"
+  echo "WIFI&VPN" > "$TRANSPORT_FILE"
+  wait_for "VPN active -> Private DNS disabled" 30 && ok "toggle works after restart" || { no "toggle after restart"; cat "$LOG_FILE"; }
+  kill -9 "$sup" 2>/dev/null
   stop_watcher
   ;;
 esac

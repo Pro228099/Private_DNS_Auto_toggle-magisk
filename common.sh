@@ -15,6 +15,7 @@ FLAG_FILE="${FLAG_FILE:-/data/adb/private_dns_auto_toggle.vpn}"
 PID_FILE="${PID_FILE:-/data/adb/private_dns_auto_toggle.pid}"
 SAFETY_PID_FILE="${SAFETY_PID_FILE:-/data/adb/private_dns_auto_toggle.safety.pid}"
 LOGCAT_PID_FILE="${LOGCAT_PID_FILE:-/data/adb/private_dns_auto_toggle.logcat.pid}"
+HEARTBEAT_FILE="${HEARTBEAT_FILE:-/data/adb/private_dns_auto_toggle.heartbeat}"
 FIFO_FILE="${FIFO_FILE:-/data/adb/private_dns_auto_toggle.fifo}"
 LOG_FILE="${LOG_FILE:-/data/adb/private_dns_auto_toggle.log}"
 
@@ -222,9 +223,20 @@ restore_dns() {
 # missed or duplicated event can never double-toggle. Callers pass a short label
 # for the log ("startup", "event", "poll").
 reconcile() {
+    date +%s > "$HEARTBEAT_FILE" 2>/dev/null
     if is_vpn_active; then
-        [ -f "$FLAG_FILE" ] && return 0
-        log_msg "VPN detected ($1; $LAST_TRANSPORTS)"
+        # The flag means "this module is currently holding Private DNS off". Do
+        # not trust it blindly: the user or the ROM can re-enable Private DNS
+        # while the VPN stays up (that is exactly the "still doesn't turn off"
+        # report), and a stale flag from an older version would then make every
+        # automatic check a no-op. Re-assert whenever the live mode is not the
+        # one we set.
+        if [ -f "$FLAG_FILE" ]; then
+            [ "$(settings_get global private_dns_mode)" = "$DNS_MODE" ] && return 0
+            log_msg "Private DNS changed externally while VPN up ($1); re-asserting"
+        else
+            log_msg "VPN detected ($1; $LAST_TRANSPORTS)"
+        fi
         # Only record the flag once the write actually took effect. Otherwise the
         # next safety poll retries instead of believing the job is done.
         disable_dns && : > "$FLAG_FILE"
@@ -366,10 +378,10 @@ poll_loop() {
 # Entry point run in the background by service.sh.
 watch_main() {
     save_state_if_enabled
-    # The flag survives in /data across a reboot, but Android resets Private DNS
-    # on boot, so drop it and let the startup reconcile decide from scratch.
-    rm -f "$FLAG_FILE"
-    # Reconcile once up front: a VPN may already be up when we start.
+    # Reconcile once up front: a VPN may already be up when we start. The flag is
+    # deliberately not wiped first: reconcile verifies the live mode against it,
+    # so even a stale flag (from a crash, a reboot, or an older version) cannot
+    # stop the toggle from working.
     reconcile "startup"
     if [ "$EVENT_MODE" = true ]; then
         event_loop
@@ -407,18 +419,59 @@ stop_watcher() {
         [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
         rm -f "$PID_FILE"
     fi
-    rm -f "$FIFO_FILE"
+    rm -f "$FIFO_FILE" "$HEARTBEAT_FILE"
+}
+
+# The watcher runs in the background and nothing in Android restarts it if it
+# dies (Magisk has no cron). A supervisor stays resident instead: it restarts the
+# watcher when its pid is gone and when the heartbeat is stale (a hung watcher).
+# It exits once the module is marked for removal or disabled.
+supervise_watcher() {
+    local pid hb now stale
+    while :; do
+        if [ ! -d "$MODDIR" ] || [ -f "$MODDIR/remove" ] || [ -f "$MODDIR/disable" ]; then
+            log_msg "Supervisor: module disabled/removed; stopping"
+            stop_watcher
+            return 0
+        fi
+        stale=1
+        if [ -f "$HEARTBEAT_FILE" ]; then
+            hb="$(cat "$HEARTBEAT_FILE" 2>/dev/null)"
+            now="$(date +%s)"
+            case "$hb" in ''|*[!0-9]*) hb=0 ;; esac
+            [ $((now - hb)) -lt "$((POLL_INTERVAL * 3 + 60))" ] && stale=0
+        fi
+        pid="$(cat "$PID_FILE" 2>/dev/null)"
+        # A dead process can linger as a zombie until its parent reaps it, so a
+        # bare /proc check would still call it alive; read its state too.
+        if [ -z "$pid" ] || [ ! -d "/proc/$pid" ] \
+            || [ "$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)" = Z ] || [ "$stale" = 1 ]; then
+            log_msg "Supervisor: watcher ${pid:-absent} gone or stale; restarting"
+            start_watcher
+        fi
+        "$SLEEP_BIN" "$POLL_INTERVAL"
+    done
 }
 
 # Everything needed to see why a device does or does not toggle. Printed by the
 # Action button and written to the log at startup.
 diag_dump() {
-    local netdev_vpn
-    netdev_vpn="$(grep -E '^ *(tun|ppp|pptp|tap|wg|ipsec|vpn)' "$NETDEV_FILE" 2>/dev/null \
-        | cut -d: -f1 | tr -d ' ' | tr '\n' ' ')"
+    local netdev_vpn="" dev pid
+    if [ -r "$NETDEV_FILE" ]; then
+        while read -r dev; do
+            dev="${dev%%:*}"; dev="${dev##* }"
+            vpn_iface_name "$dev" && netdev_vpn="$netdev_vpn$dev "
+        done < "$NETDEV_FILE"
+    fi
+    pid="$(cat "$PID_FILE" 2>/dev/null)"
     echo "settings binary : $SETTINGS_BIN [$([ -x "$SETTINGS_BIN" ] && echo ok || echo missing)]"
     echo "private_dns_mode: $(settings_get global private_dns_mode)"
     echo "specifier       : $(settings_get global private_dns_specifier)"
+    echo "watcher         : ${pid:-none} $(if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then echo alive; else echo dead; fi)"
+    echo "state flag      : $([ -f "$FLAG_FILE" ] && echo set || echo unset)"
+    if [ -f "$HEARTBEAT_FILE" ]; then
+        echo "heartbeat       : $(cat "$HEARTBEAT_FILE" 2>/dev/null) (now $(date +%s))"
+    fi
     echo "sysfs net       : $(ls "$SYSFS_NET" 2>/dev/null | tr '\n' ' ')"
     echo "netdev vpn iface: ${netdev_vpn:-none}"
     echo "dumpsys VPN     : $("$DUMPSYS_BIN" connectivity 2>/dev/null \
@@ -437,6 +490,7 @@ run_once() {
     if is_vpn_active; then
         echo "VPN: ACTIVE (${LAST_TRANSPORTS})"
         if disable_dns; then
+            : > "$FLAG_FILE"
             echo "Action: private_dns_mode -> $(settings_get global private_dns_mode)"
         else
             echo "Action: FAILED to change Private DNS (see $LOG_FILE)"
@@ -444,6 +498,7 @@ run_once() {
     else
         echo "VPN: INACTIVE (${LAST_TRANSPORTS})"
         restore_dns
+        rm -f "$FLAG_FILE"
         echo "Action: private_dns_mode = $(settings_get global private_dns_mode)"
     fi
 }

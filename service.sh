@@ -35,6 +35,10 @@ log_diag
 
 if [ "$AUTO_START" = true ]; then
     start_watcher
+    # Stay resident and keep the watcher alive. late_start runs once, and nothing
+    # else would bring the watcher back if it ever died, so the toggle could
+    # silently stop working until the next reboot.
+    supervise_watcher
 else
     log_msg "AUTO_START=false -> watcher not started (use the action button)"
 fi

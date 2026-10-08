@@ -7,7 +7,7 @@ SHELL_BIN=${SHELL_BIN:-sh}
 TMP=${TMPDIR:-/tmp}/pdt_tests
 rm -rf "$TMP"; mkdir -p "$TMP"
 TP=0; TF=0
-for n in 1 2 3 4 5 6 7 8 9 10 11; do
+for n in 1 2 3 4 5 6 7 8 9 10 11 12 13; do
     root="$TMP/run$n"
     rm -rf "$root"; mkdir -p "$root"
     echo "=== Scenario $n ==="
