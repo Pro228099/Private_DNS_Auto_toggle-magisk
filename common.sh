@@ -39,8 +39,10 @@ LAST_TRANSPORTS=""
 # Defaults (overridable from the config file).
 INTERVAL=5
 POLL_INTERVAL=30
+POLL_INTERVAL_ACTIVE=5
 CHECK_INTERVAL=10
 SETTLE=1
+EVENT_WAIT=4
 EVENT_MODE=true
 AUTO_START=true
 RESTORE_ON_EXIT=true
@@ -222,16 +224,41 @@ reconcile() {
     fi
 }
 
-# True for the log lines the framework emits on every VPN state change. AOSP's
-# Vpn.java keeps LOGD=true on Android 11-15, so "setting state=..." is always
-# printed with tag "Vpn"; "Established by" is the INFO line on connect.
-is_vpn_event() {
+# Direction of a log event: "up", "down" or "" (unrelated line). AOSP's Vpn.java
+# keeps LOGD=true on Android 11-15, so "setting state=..." is always printed with
+# tag "Vpn"; "Established by" is the INFO line on connect.
+vpn_event_dir() {
     case "$1" in
-        *"state=CONNECTED"*|*"state=DISCONNECTED"*|*"state=FAILED"*|*"Established by"*)
-            return 0
-            ;;
+        *"state=CONNECTED"*|*"Established by"*) echo up ;;
+        *"state=DISCONNECTED"*|*"state=FAILED"*) echo down ;;
+        *) echo "" ;;
     esac
-    return 1
+}
+
+# Act on a log event. The line says which way the state is going, but the tunnel
+# interface appears/disappears about a second after it, so we first wait for the
+# live probe to agree (the ground truth). If it never agrees we still apply the
+# direction the log reported, so a DISCONNECT always restores Private DNS. Relying
+# on the probe alone here was the intermittent bug: at settle time the probe still
+# shows the old state, so the opposite action ran, or nothing did and Private DNS
+# was never restored.
+reconcile_event() {
+    local dir="$1" n=0 limit=$((SETTLE + EVENT_WAIT))
+    while [ "$n" -lt "$limit" ]; do
+        if [ "$dir" = up ]; then
+            is_vpn_active && { reconcile "event:$dir"; return 0; }
+        else
+            is_vpn_active || { reconcile "event:$dir"; return 0; }
+        fi
+        "$SLEEP_BIN" 1
+        n=$((n + 1))
+    done
+    log_msg "Event=$dir not confirmed by probe within ${limit}s; applying anyway ($LAST_TRANSPORTS)"
+    if [ "$dir" = up ]; then
+        disable_dns && : > "$FLAG_FILE"
+    else
+        restore_dns && rm -f "$FLAG_FILE"
+    fi
 }
 
 # Event-driven watcher: follows the "Vpn" log tag so connect/disconnect are
@@ -242,7 +269,7 @@ is_vpn_event() {
 # time. The poll is the safety net; because reconcile() is idempotent, it stays
 # silent while the events are doing their job.
 event_loop() {
-    local line lpid probe
+    local line lpid probe dir
     if [ ! -x "$LOGCAT_BIN" ] && ! command -v "$LOGCAT_BIN" >/dev/null 2>&1; then
         log_msg "ERROR: logcat not found; using polling"
         poll_loop
@@ -276,10 +303,10 @@ event_loop() {
         lpid=$!
         echo "$lpid" > "$LOGCAT_PID_FILE"
         while IFS= read -r line; do
-            if is_vpn_event "$line"; then
+            dir="$(vpn_event_dir "$line")"
+            if [ -n "$dir" ]; then
                 log_msg "Event: $line"
-                "$SLEEP_BIN" "$SETTLE"
-                reconcile "event"
+                reconcile_event "$dir"
             fi
         done < "$FIFO_FILE"
         kill -9 "$lpid" 2>/dev/null
@@ -294,8 +321,17 @@ event_loop() {
 # leave the module stuck. Logs nothing unless the state actually changes. It
 # exits by itself once the watcher tears the fifo down.
 safety_loop() {
+    local wait
     while [ -p "$FIFO_FILE" ]; do
-        "$SLEEP_BIN" "$POLL_INTERVAL"
+        # While we are holding Private DNS off (flag set) poll fast, so the restore
+        # on disconnect happens quickly even if the log event was missed; otherwise
+        # stay slow to cost nothing.
+        if [ -f "$FLAG_FILE" ]; then
+            wait="$POLL_INTERVAL_ACTIVE"
+        else
+            wait="$POLL_INTERVAL"
+        fi
+        "$SLEEP_BIN" "$wait"
         [ -p "$FIFO_FILE" ] || break
         reconcile "safety"
     done

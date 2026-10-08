@@ -20,6 +20,17 @@ if [ -f /data/adb/private_dns_auto_toggle.conf ]; then
         } >> /data/adb/private_dns_auto_toggle.conf
         ui_print "- Config migrated: EVENT_MODE / POLL_INTERVAL added"
     fi
+    if ! grep -q '^POLL_INTERVAL_ACTIVE=' /data/adb/private_dns_auto_toggle.conf; then
+        {
+            echo ""
+            echo "# Added in v1.1.3"
+            echo "# Fast safety-net interval while a VPN is active (seconds)."
+            echo "POLL_INTERVAL_ACTIVE=5"
+            echo "# Seconds to wait for the live probe to confirm a log event."
+            echo "EVENT_WAIT=4"
+        } >> /data/adb/private_dns_auto_toggle.conf
+        ui_print "- Config migrated: POLL_INTERVAL_ACTIVE / EVENT_WAIT added"
+    fi
 fi
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644
