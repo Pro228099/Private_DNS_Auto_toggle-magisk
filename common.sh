@@ -32,6 +32,7 @@ LOGCAT_BIN="${LOGCAT_BIN:-logcat}"
 SLEEP_BIN="${SLEEP_BIN:-sleep}"
 MKFIFO_BIN="${MKFIFO_BIN:-mkfifo}"
 SYSFS_NET="${SYSFS_NET:-/sys/class/net}"
+NETDEV_FILE="${NETDEV_FILE:-/proc/net/dev}"
 
 # Human-readable reason for the last is_vpn_active result (for logging).
 LAST_TRANSPORTS=""
@@ -81,45 +82,55 @@ settings_put() {
     return 1
 }
 
-# True when a VPN tunnel is active. Three independent signals, any of which
-# counts; LAST_TRANSPORTS says which one matched.
-#
-# 1) sysfs: the presence of a tun/ppp/pptp/tap/wg/ipsec interface means a
-#    VpnService tunnel is up (these interfaces only exist while it is). We do not
-#    require operstate=up because some kernels report "unknown".
-# 2) dumpsys connectivity: scan EVERY "Transports:" line, not just the first. On
-#    Android 12+ the listing prints each network, and the active default network
-#    can still be the underlying WiFi/CELL with the VPN in a separate block, so
-#    looking at the first line alone misses the tunnel (this was the bug: Private
-#    DNS stayed on while a VPN was connected). We only ever match tokens inside a
-#    Transports field, so the "NOT_VPN" capability of ordinary networks can never
-#    count.
-# 3) dumpsys fallback: a "NetworkAgentInfo [VPN ...]" block also proves a tunnel.
-is_vpn_active() {
-    local iface oper
+# Names of interfaces that only exist while a VpnService tunnel is up.
+vpn_iface_name() {
+    case "$1" in
+        tun[0-9]*|ppp[0-9]*|pptp[0-9]*|tap[0-9]*|wg[0-9]*|ipsec[0-9]*|vpn[0-9]*) return 0 ;;
+    esac
+    return 1
+}
 
+# True when a VPN tunnel is active. Any of several independent signals counts;
+# LAST_TRANSPORTS records which one matched. Detection is deliberately broad so
+# it works across ROMs whose `dumpsys` output differs:
+#   - a tun/ppp/pptp/tap/wg/ipsec interface exists in /sys/class/net or /proc/net/dev
+#     (these interfaces only exist while a VpnService tunnel is up);
+#   - a "Transports:" field anywhere lists the VPN token ('&'-separated);
+#   - a "NetworkAgentInfo [VPN" block or a "type: VPN" line is present.
+# The bare word "VPN" is never grepped, because every network prints "NOT_VPN"
+# among its capabilities.
+is_vpn_active() {
+    local iface dev
+
+    # 1a) sysfs: the interface's mere existence means a tunnel is up. operstate is
+    #     ignored because some kernels report "unknown" for a working tunnel.
     if [ -d "$SYSFS_NET" ]; then
         for iface in "$SYSFS_NET"/*; do
             [ -e "$iface" ] || continue
             iface="${iface##*/}"
-            case "$iface" in
-                tun[0-9]*|ppp[0-9]*|pptp[0-9]*|tap[0-9]*|wg[0-9]*|ipsec[0-9]*|vpn[0-9]*)
-                    oper="$(cat "$SYSFS_NET/$iface/operstate" 2>/dev/null)"
-                    case "$oper" in
-                        up|unknown|"") 
-                            LAST_TRANSPORTS="iface $iface ${oper:-present}"
-                            return 0
-                            ;;
-                    esac
-                    ;;
-            esac
+            if vpn_iface_name "$iface"; then
+                LAST_TRANSPORTS="iface $iface"
+                return 0
+            fi
         done
+    fi
+
+    # 1b) /proc/net/dev: same signal, works even if /sys is restricted.
+    if [ -r "$NETDEV_FILE" ]; then
+        while read -r dev; do
+            dev="${dev%%:*}"
+            dev="${dev##* }"
+            if vpn_iface_name "$dev"; then
+                LAST_TRANSPORTS="netdev $dev"
+                return 0
+            fi
+        done < "$NETDEV_FILE"
     fi
 
     local dump transports active
     dump="$("$DUMPSYS_BIN" connectivity 2>/dev/null)"
 
-    # All Transports fields, one per line; the VPN token is an '&'-separated part.
+    # 2) every "Transports:" field, one per line; VPN is an '&'-separated token.
     transports="$(printf '%s\n' "$dump" \
         | sed -n 's/.*Transports:[[:space:]]*\([^[:space:]]*\).*/\1/p')"
     for active in $transports; do
@@ -131,11 +142,11 @@ is_vpn_active() {
         esac
     done
 
-    # Fallback: an explicit VPN NetworkAgentInfo block.
-    if printf '%s\n' "$dump" | grep -q 'NetworkAgentInfo \[VPN'; then
-        LAST_TRANSPORTS="agent: VPN"
-        return 0
-    fi
+    # 3) a VPN network block, whatever exact spelling the ROM uses.
+    case "$dump" in
+        *"NetworkAgentInfo [VPN"*) LAST_TRANSPORTS="agent: NetworkAgentInfo [VPN"; return 0 ;;
+        *"type: VPN"*)            LAST_TRANSPORTS="agent: type VPN"; return 0 ;;
+    esac
 
     active="$(printf '%s\n' "$transports" | head -n 1)"
     LAST_TRANSPORTS="conn: ${active:-none}"
@@ -219,6 +230,13 @@ reconcile() {
         disable_dns && : > "$FLAG_FILE"
     else
         [ -f "$FLAG_FILE" ] || return 0
+        # Guard against one flaky "no VPN" read flipping Private DNS back on while
+        # the tunnel is really still up: confirm once more before restoring.
+        "$SLEEP_BIN" 1
+        if is_vpn_active; then
+            log_msg "VPN still active on recheck ($1; $LAST_TRANSPORTS); keeping Private DNS off"
+            return 0
+        fi
         log_msg "VPN gone ($1; $LAST_TRANSPORTS)"
         restore_dns && rm -f "$FLAG_FILE"
     fi
@@ -392,24 +410,40 @@ stop_watcher() {
     rm -f "$FIFO_FILE"
 }
 
+# Everything needed to see why a device does or does not toggle. Printed by the
+# Action button and written to the log at startup.
+diag_dump() {
+    local netdev_vpn
+    netdev_vpn="$(grep -E '^ *(tun|ppp|pptp|tap|wg|ipsec|vpn)' "$NETDEV_FILE" 2>/dev/null \
+        | cut -d: -f1 | tr -d ' ' | tr '\n' ' ')"
+    echo "settings binary : $SETTINGS_BIN [$([ -x "$SETTINGS_BIN" ] && echo ok || echo missing)]"
+    echo "private_dns_mode: $(settings_get global private_dns_mode)"
+    echo "specifier       : $(settings_get global private_dns_specifier)"
+    echo "sysfs net       : $(ls "$SYSFS_NET" 2>/dev/null | tr '\n' ' ')"
+    echo "netdev vpn iface: ${netdev_vpn:-none}"
+    echo "dumpsys VPN     : $("$DUMPSYS_BIN" connectivity 2>/dev/null \
+        | grep -E 'Transports:|NetworkAgentInfo \[VPN|type: VPN' | head -n 8 | tr '\n' '|')"
+}
+
+log_diag() {
+    [ "$LOG" = true ] || return 0
+    { echo "$(date '+%Y-%m-%d %H:%M:%S') --- diagnostics ---"; diag_dump; } >> "$LOG_FILE"
+}
+
 # One-shot check used by action.sh (button in the Magisk app). Prints enough
 # detail to diagnose why nothing changes on a given device.
 run_once() {
-    local cur cur_spec
-    cur="$(settings_get global private_dns_mode)"
-    cur_spec="$(settings_get global private_dns_specifier)"
-    echo "settings binary: $SETTINGS_BIN [$([ -x "$SETTINGS_BIN" ] && echo ok || echo missing)]"
-    echo "current: private_dns_mode=${cur:-<empty>} specifier=${cur_spec:-<empty>}"
+    diag_dump
     if is_vpn_active; then
-        echo "VPN: active (${LAST_TRANSPORTS})"
+        echo "VPN: ACTIVE (${LAST_TRANSPORTS})"
         if disable_dns; then
-            echo "Action: Private DNS -> $(settings_get global private_dns_mode)"
+            echo "Action: private_dns_mode -> $(settings_get global private_dns_mode)"
         else
             echo "Action: FAILED to change Private DNS (see $LOG_FILE)"
         fi
     else
-        echo "VPN: inactive (${LAST_TRANSPORTS})"
+        echo "VPN: INACTIVE (${LAST_TRANSPORTS})"
         restore_dns
-        echo "Action: Private DNS now $(settings_get global private_dns_mode)"
+        echo "Action: private_dns_mode = $(settings_get global private_dns_mode)"
     fi
 }

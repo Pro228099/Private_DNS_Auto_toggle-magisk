@@ -31,6 +31,7 @@ if [ -x "$SETTINGS_BIN" ]; then
 else
     log_msg "ERROR: 'settings' binary not found at $SETTINGS_BIN; cannot toggle Private DNS"
 fi
+log_diag
 
 if [ "$AUTO_START" = true ]; then
     start_watcher

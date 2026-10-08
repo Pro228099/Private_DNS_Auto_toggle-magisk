@@ -28,6 +28,12 @@ jobs:
           done
           grep -qE '^id=[a-zA-Z0-9._-]+$' module.prop
           echo "module.prop OK"
+      - name: Install mksh (Android's /system/bin/sh)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mksh
+      - name: Run test suite (sh + mksh)
+        run: |
+          sh tests/all.sh
+          SHELL_BIN=mksh sh tests/all.sh
 
   package:
     needs: lint
