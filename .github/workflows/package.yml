@@ -1,14 +1,22 @@
 name: Package Magisk module
 
+# A release pushes a commit to main and then a tag; listening to both made every
+# version run the whole pipeline twice. The pipeline now hangs off the tag alone
+# (that is the artifact that matters), with PRs and manual dispatch as the other
+# entry points, so one version produces exactly one run.
 on:
   push:
-    branches: [main]
     tags: ['v*']
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# Collapse duplicate runs for the same ref instead of queueing them.
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
