@@ -51,10 +51,10 @@ LAST_TRANSPORTS=""
 # Defaults (overridable from the config file).
 INTERVAL=5
 POLL_INTERVAL=30
-POLL_INTERVAL_ACTIVE=5
+POLL_INTERVAL_ACTIVE=3
 CHECK_INTERVAL=10
-SETTLE=1
-EVENT_WAIT=4
+SETTLE=0
+EVENT_WAIT=3
 EVENT_MODE=true
 AUTO_START=true
 RESTORE_ON_EXIT=true
@@ -293,8 +293,14 @@ reconcile() {
         # file (fast path) or the durable state marker (survives a lost flag).
         [ -f "$FLAG_FILE" ] || state_is_managed || return 0
         # Guard against one flaky "no VPN" read flipping Private DNS back on while
-        # the tunnel is really still up: confirm once more before restoring.
-        "$SLEEP_BIN" 1
+        # the tunnel is really still up: confirm once more before restoring. The
+        # event path (reconcile_event) has already waited for the probe to agree,
+        # so it can skip this debounce and restore immediately -- the debounce is
+        # only needed by the timer paths, where a single stray read is all we have.
+        case "$1" in
+            event:*) : ;;
+            *) "$SLEEP_BIN" 1 ;;
+        esac
         if is_vpn_active; then
             log_msg "VPN still active on recheck ($1; $LAST_TRANSPORTS); keeping Private DNS off"
             return 0
