@@ -267,6 +267,55 @@ case "$N" in
   kill -9 "$sup" 2>/dev/null
   stop_watcher
   ;;
+14)
+  # Real-interface detection, as on the reporting device: the tunnel shows up as
+  # tun0 in /proc/net/dev and dumpsys never lists a VPN network. Connect must
+  # disable Private DNS and disconnect must restore mode AND specifier.
+  export LOGCAT_BIN=$BIN/logcat
+  echo "WIFI" > "$TRANSPORT_FILE"
+  start_watcher; /bin/sleep 1
+  printf 'Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes\n    lo: 100 1 0 0 0 0 0 0 100 1 0 0 0 0 0 0\n  tun0: 200 2 0 0 0 0 0 0 200 2 0 0 0 0 0 0\n' > "$NETDEV_FILE"
+  echo "10-08 00:00:01.0  1  1 I Vpn     : setting state=CONNECTED, reason=establish" >> "$FEED_FILE"
+  wait_for "VPN active -> Private DNS disabled" 30 && ok "iface connect disabled DNS" || { no "iface connect"; cat "$LOG_FILE"; }
+  [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = off ] && ok "mode off after iface connect" || no "mode should be off"
+  : > "$NETDEV_FILE"
+  echo "10-08 00:00:09.0  1  1 D Vpn     : setting state=DISCONNECTED, reason=agentDisconnect" >> "$FEED_FILE"
+  wait_for "VPN inactive -> Private DNS restored" 30 && ok "iface disconnect restored DNS" || { no "iface restore"; cat "$LOG_FILE"; }
+  [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = hostname ] && ok "mode restored after iface disconnect" || no "mode should be hostname"
+  [ "$(cat "$SETTINGS_DIR/global.private_dns_specifier")" = xbox-dns.ru ] && ok "specifier restored" || no "specifier should be restored"
+  [ ! -f "$FLAG_FILE" ] && ok "flag cleared after iface restore" || no "flag should be cleared"
+  stop_watcher
+  ;;
+15)
+  # Same interface-based connect/disconnect, but the log stream is dead, so only
+  # the safety poll can restore. The restore must not depend on the event stream.
+  export LOGCAT_BIN=$BIN/logcat_exit
+  echo "WIFI" > "$TRANSPORT_FILE"
+  start_watcher; /bin/sleep 1
+  printf 'Inter-|   Receive\n face |bytes\n    lo: 100 1 0 0 0 0 0 0 100 1 0 0 0 0 0 0\n  tun0: 200 2 0 0 0 0 0 0 200 2 0 0 0 0 0 0\n' > "$NETDEV_FILE"
+  wait_for "VPN active -> Private DNS disabled" 30 && ok "safety disabled on iface up" || { no "safety disable"; cat "$LOG_FILE"; }
+  : > "$NETDEV_FILE"
+  wait_for "VPN inactive -> Private DNS restored" 30 && ok "safety restored on iface down" || { no "safety restore"; cat "$LOG_FILE"; }
+  [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = hostname ] && ok "mode restored via safety" || no "mode should be hostname"
+  stop_watcher
+  ;;
+16)
+  # The flag file is not durable: it is wiped on every watcher restart and can be
+  # lost to a crash. The managed marker in the state file must still drive the
+  # restore, otherwise Private DNS would stay off after the VPN goes away.
+  export LOGCAT_BIN=$BIN/logcat_exit
+  echo "WIFI" > "$TRANSPORT_FILE"
+  start_watcher; /bin/sleep 1
+  printf 'Inter-|   Receive\n face |bytes\n    lo: 100 1 0 0 0 0 0 0 100 1 0 0 0 0 0 0\n  tun0: 200 2 0 0 0 0 0 0 200 2 0 0 0 0 0 0\n' > "$NETDEV_FILE"
+  wait_for "VPN active -> Private DNS disabled" 30 && ok "disabled on iface up" || { no "no disable"; cat "$LOG_FILE"; }
+  grep -q '^managed=1' "$STATE_FILE" && ok "state marked managed" || no "state should be marked managed"
+  rm -f "$FLAG_FILE"                    # flag lost (restart/crash)
+  : > "$NETDEV_FILE"
+  wait_for "VPN inactive -> Private DNS restored" 60 && ok "restored via durable marker" || { no "no restore"; cat "$LOG_FILE"; }
+  [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = hostname ] && ok "mode restored without flag" || no "mode should be hostname"
+  grep -q '^managed=1' "$STATE_FILE" && no "marker should be cleared" || ok "marker cleared after restore"
+  stop_watcher
+  ;;
 esac
 
 echo "  scenario $N: $PASS passed, $FAIL failed"

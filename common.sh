@@ -101,7 +101,7 @@ vpn_iface_name() {
 # The bare word "VPN" is never grepped, because every network prints "NOT_VPN"
 # among its capabilities.
 is_vpn_active() {
-    local iface dev
+    local iface dev dump transports active iface_seen=0
 
     # 1a) sysfs: the interface's mere existence means a tunnel is up. operstate is
     #     ignored because some kernels report "unknown" for a working tunnel.
@@ -109,6 +109,7 @@ is_vpn_active() {
         for iface in "$SYSFS_NET"/*; do
             [ -e "$iface" ] || continue
             iface="${iface##*/}"
+            iface_seen=1
             if vpn_iface_name "$iface"; then
                 LAST_TRANSPORTS="iface $iface"
                 return 0
@@ -121,6 +122,7 @@ is_vpn_active() {
         while read -r dev; do
             dev="${dev%%:*}"
             dev="${dev##* }"
+            [ -n "$dev" ] && iface_seen=1
             if vpn_iface_name "$dev"; then
                 LAST_TRANSPORTS="netdev $dev"
                 return 0
@@ -128,7 +130,6 @@ is_vpn_active() {
         done < "$NETDEV_FILE"
     fi
 
-    local dump transports active
     dump="$("$DUMPSYS_BIN" connectivity 2>/dev/null)"
 
     # 2) every "Transports:" field, one per line; VPN is an '&'-separated token.
@@ -143,11 +144,18 @@ is_vpn_active() {
         esac
     done
 
-    # 3) a VPN network block, whatever exact spelling the ROM uses.
-    case "$dump" in
-        *"NetworkAgentInfo [VPN"*) LAST_TRANSPORTS="agent: NetworkAgentInfo [VPN"; return 0 ;;
-        *"type: VPN"*)            LAST_TRANSPORTS="agent: type VPN"; return 0 ;;
-    esac
+    # 3) a VPN network block, whatever exact spelling the ROM uses. This is the
+    #    flimsiest signal: some ROMs keep printing the block for a while after the
+    #    tunnel is gone, which would keep the module thinking the VPN is up and
+    #    block the restore. So only trust it when we could not read the interface
+    #    list at all -- a live VpnService always has a tunnel interface, so an
+    #    empty, readable list is stronger evidence than a leftover block.
+    if [ "$iface_seen" = 0 ]; then
+        case "$dump" in
+            *"NetworkAgentInfo [VPN"*) LAST_TRANSPORTS="agent: NetworkAgentInfo [VPN"; return 0 ;;
+            *"type: VPN"*)            LAST_TRANSPORTS="agent: type VPN"; return 0 ;;
+        esac
+    fi
 
     active="$(printf '%s\n' "$transports" | head -n 1)"
     LAST_TRANSPORTS="conn: ${active:-none}"
@@ -161,6 +169,27 @@ save_state() {
     } > "$STATE_FILE"
 }
 
+# Durable "this module is holding Private DNS off" marker, kept inside the state
+# file next to the saved preference. The flag file alone is not enough: it is
+# deleted on every watcher restart and can be lost to a crash, and without either
+# signal the disconnect path would never put Private DNS back.
+state_mark_managed() {
+    [ -f "$STATE_FILE" ] || return 0
+    grep -q '^mode=' "$STATE_FILE" 2>/dev/null || return 0
+    grep -q '^managed=' "$STATE_FILE" 2>/dev/null && return 0
+    echo "managed=1" >> "$STATE_FILE"
+}
+
+state_is_managed() {
+    [ -f "$STATE_FILE" ] && grep -q '^managed=1' "$STATE_FILE" 2>/dev/null
+}
+
+state_clear_managed() {
+    [ -f "$STATE_FILE" ] || return 0
+    grep -v '^managed=' "$STATE_FILE" > "$STATE_FILE.tmp" 2>/dev/null \
+        && mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
 # Only overwrite the saved state while Private DNS is actually enabled, so the
 # user's real preference survives across VPN connect/disconnect cycles. Logs only
 # when the value changes.
@@ -172,6 +201,10 @@ save_state_if_enabled() {
         save_state
         [ "$old" = "$mode" ] || log_msg "Saved Private DNS state: mode=$mode"
     fi
+    # Refresh the managed marker so a disconnect is always able to restore, even
+    # if the flag file was lost. Only meaningful once we actually hold the setting
+    # off, i.e. while the flag is set.
+    [ -f "$FLAG_FILE" ] && state_mark_managed
 }
 
 disable_dns() {
@@ -207,12 +240,14 @@ restore_dns() {
         log_msg "DRY-RUN: would restore private_dns_mode=$mode specifier=$specifier"
         return 0
     fi
+    # Put the specifier back before switching the mode on: while mode=off it is
+    # inert, and it must already be in place when the mode becomes hostname.
+    if [ "$mode" = "hostname" ] && [ -n "$specifier" ]; then
+        settings_put global private_dns_specifier "$specifier"
+    fi
     if ! settings_put global private_dns_mode "$mode"; then
         log_msg "ERROR: failed to restore private_dns_mode=$mode (settings put rejected); will retry"
         return 1
-    fi
-    if [ "$mode" = "hostname" ] && [ -n "$specifier" ]; then
-        settings_put global private_dns_specifier "$specifier"
     fi
     log_msg "VPN inactive -> Private DNS restored (mode=$mode specifier=$specifier)"
     return 0
@@ -239,9 +274,14 @@ reconcile() {
         fi
         # Only record the flag once the write actually took effect. Otherwise the
         # next safety poll retries instead of believing the job is done.
-        disable_dns && : > "$FLAG_FILE"
+        if disable_dns; then
+            : > "$FLAG_FILE"
+            state_mark_managed
+        fi
     else
-        [ -f "$FLAG_FILE" ] || return 0
+        # Restore when either signal says we are holding the setting off: the flag
+        # file (fast path) or the durable state marker (survives a lost flag).
+        [ -f "$FLAG_FILE" ] || state_is_managed || return 0
         # Guard against one flaky "no VPN" read flipping Private DNS back on while
         # the tunnel is really still up: confirm once more before restoring.
         "$SLEEP_BIN" 1
@@ -250,7 +290,7 @@ reconcile() {
             return 0
         fi
         log_msg "VPN gone ($1; $LAST_TRANSPORTS)"
-        restore_dns && rm -f "$FLAG_FILE"
+        restore_dns && { rm -f "$FLAG_FILE"; state_clear_managed; }
     fi
 }
 
@@ -285,9 +325,9 @@ reconcile_event() {
     done
     log_msg "Event=$dir not confirmed by probe within ${limit}s; applying anyway ($LAST_TRANSPORTS)"
     if [ "$dir" = up ]; then
-        disable_dns && : > "$FLAG_FILE"
+        disable_dns && { : > "$FLAG_FILE"; state_mark_managed; }
     else
-        restore_dns && rm -f "$FLAG_FILE"
+        restore_dns && { rm -f "$FLAG_FILE"; state_clear_managed; }
     fi
 }
 
@@ -491,6 +531,7 @@ run_once() {
         echo "VPN: ACTIVE (${LAST_TRANSPORTS})"
         if disable_dns; then
             : > "$FLAG_FILE"
+            state_mark_managed
             echo "Action: private_dns_mode -> $(settings_get global private_dns_mode)"
         else
             echo "Action: FAILED to change Private DNS (see $LOG_FILE)"
@@ -499,6 +540,7 @@ run_once() {
         echo "VPN: INACTIVE (${LAST_TRANSPORTS})"
         restore_dns
         rm -f "$FLAG_FILE"
+        state_clear_managed
         echo "Action: private_dns_mode = $(settings_get global private_dns_mode)"
     fi
 }
