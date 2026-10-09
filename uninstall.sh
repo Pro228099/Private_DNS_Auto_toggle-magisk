@@ -7,7 +7,8 @@ MODDIR=${0%/*}
 # shellcheck disable=SC1091
 . "$MODDIR/common.sh"
 
-stop_watcher
+# Kill the supervisor too, or it would resurrect the watcher after removal.
+stop_daemon
 
 # Restore the user's Private DNS setting so nothing is left disabled.
 load_config
@@ -15,4 +16,4 @@ if [ "$RESTORE_ON_EXIT" = true ]; then
     restore_dns
 fi
 
-rm -f "$PID_FILE" "$STATE_FILE" "$FLAG_FILE" "$LOGCAT_PID_FILE" "$SAFETY_PID_FILE" "$FIFO_FILE" "$HEARTBEAT_FILE"
+rm -f "$PID_FILE" "$SUP_PID_FILE" "$STATE_FILE" "$FLAG_FILE" "$LOGCAT_PID_FILE" "$SAFETY_PID_FILE" "$FIFO_FILE" "$HEARTBEAT_FILE"

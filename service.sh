@@ -34,11 +34,13 @@ fi
 log_diag
 
 if [ "$AUTO_START" = true ]; then
-    start_watcher
-    # Stay resident and keep the watcher alive. late_start runs once, and nothing
-    # else would bring the watcher back if it ever died, so the toggle could
-    # silently stop working until the next reboot.
-    supervise_watcher
+    # Launch the watcher+supervisor as a detached daemon and return. A plain child
+    # of this script is not safe: when the service process's session ends, the ROM
+    # or Magisk can reap it, and then the toggle only works via the Action button
+    # (the reported "Action disables, but VPN connect does nothing"). The daemon
+    # reparents to init via `( & )` + setsid, so it outlives this script.
+    start_daemon
+    log_msg "service.sh: daemon launched; exiting"
 else
     log_msg "AUTO_START=false -> watcher not started (use the action button)"
 fi

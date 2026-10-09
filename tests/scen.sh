@@ -5,6 +5,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 MOD=${MOD:-$(cd "$HERE/.." && pwd)}
 N=$1; ROOT=$2; BIN=$ROOT/bin
 mkdir -p "$ROOT/settings" "$ROOT/net" "$BIN" "$ROOT/mod"
+# Detached-daemon support: a real shell + setsid for start_daemon, and a per-run
+# supervisor pid file.
+export SHELL_PATH=${SHELL_PATH:-/bin/sh}
+export SETSID_BIN=${SETSID_BIN:-/usr/bin/setsid}
 
 cat > "$BIN/settings" <<'EOF'
 #!/bin/sh
@@ -91,9 +95,12 @@ export SETTINGS_BIN=$BIN/settings DUMPSYS_BIN=$BIN/dumpsys LOGCAT_BIN=$BIN/logca
 export SLEEP_BIN=/bin/sleep MKFIFO_BIN=/usr/bin/mkfifo SYSFS_NET=$ROOT/net NETDEV_FILE=$ROOT/netdev
 export DUMPSYS_SEQ=$ROOT/seq
 export CONF_FILE=$ROOT/conf STATE_FILE=$ROOT/state FLAG_FILE=$ROOT/vpn.flag
-export PID_FILE=$ROOT/pid LOGCAT_PID_FILE=$ROOT/logcat.pid SAFETY_PID_FILE=$ROOT/safety.pid
+export PID_FILE=$ROOT/pid SUP_PID_FILE=$ROOT/sup.pid SUP_LOCK_DIR=$ROOT/sup.lock LOGCAT_PID_FILE=$ROOT/logcat.pid SAFETY_PID_FILE=$ROOT/safety.pid
 export FIFO_FILE=$ROOT/fifo LOG_FILE=$ROOT/log HEARTBEAT_FILE=$ROOT/heartbeat
 export MODDIR=$ROOT/mod
+# The daemon re-sources common.sh from LIB_DIR; in tests that is the real module
+# dir, while MODDIR is the (throwaway) directory the supervisor watches.
+export LIB_DIR=$MOD
 
 . "$MOD/common.sh"
 load_config
@@ -315,6 +322,57 @@ case "$N" in
   [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = hostname ] && ok "mode restored without flag" || no "mode should be hostname"
   grep -q '^managed=1' "$STATE_FILE" && no "marker should be cleared" || ok "marker cleared after restore"
   stop_watcher
+  ;;
+17)
+  # The launcher (service.sh) starts the supervisor as a detached daemon and
+  # returns. The daemon must keep the watcher alive and handle a full
+  # connect/disconnect cycle, including the restore -- the reported failure was
+  # that nothing was running after the launcher exited.
+  export LOGCAT_BIN=$BIN/logcat
+  echo "WIFI" > "$TRANSPORT_FILE"
+  start_daemon
+  pgrep_watcher && ok "daemon is running after start_daemon" || no "no daemon after start_daemon"
+  [ -n "$(cat "$SUP_PID_FILE" 2>/dev/null)" ] && ok "supervisor pid recorded" || no "no supervisor pid"
+  printf 'Inter-|   Receive\n face |bytes\n    lo: 100 1 0 0 0 0 0 0 100 1 0 0 0 0 0 0\n  tun0: 200 2 0 0 0 0 0 0 200 2 0 0 0 0 0 0\n' > "$NETDEV_FILE"
+  wait_for "VPN active -> Private DNS disabled" 30 && ok "daemon disabled on VPN up" || { no "daemon no disable"; cat "$LOG_FILE"; }
+  : > "$NETDEV_FILE"
+  wait_for "VPN inactive -> Private DNS restored" 60 && ok "daemon restored on VPN down" || { no "daemon no restore"; cat "$LOG_FILE"; }
+  [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = hostname ] && ok "mode restored by daemon" || no "mode should be hostname"
+  stop_daemon
+  ;;
+18)
+  # A tap on Action must repair a dead daemon, so the automatic toggle (and the
+  # restore) works again without a reboot.
+  export LOGCAT_BIN=$BIN/logcat
+  echo "WIFI" > "$TRANSPORT_FILE"
+  start_daemon
+  sup=$(cat "$SUP_PID_FILE" 2>/dev/null)
+  wat=$(cat "$PID_FILE" 2>/dev/null)
+  kill -9 "$sup" "$wat" 2>/dev/null
+  /bin/sleep 1
+  ensure_watcher
+  pgrep_watcher && ok "ensure_watcher revived the daemon" || no "daemon not revived"
+  printf 'Inter-|   Receive\n face |bytes\n    lo: 100 1 0 0 0 0 0 0 100 1 0 0 0 0 0 0\n  tun0: 200 2 0 0 0 0 0 0 200 2 0 0 0 0 0 0\n' > "$NETDEV_FILE"
+  wait_for "VPN active -> Private DNS disabled" 30 && ok "revived daemon disables" || { no "revived no disable"; cat "$LOG_FILE"; }
+  : > "$NETDEV_FILE"
+  wait_for "VPN inactive -> Private DNS restored" 60 && ok "revived daemon restores" || { no "revived no restore"; cat "$LOG_FILE"; }
+  [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = hostname ] && ok "mode restored after revival" || no "mode should be hostname"
+  stop_daemon
+  ;;
+19)
+  # Two daemons must never run at once: they would both poll and fight. Starting
+  # twice must leave a single watcher/supervisor.
+  export LOGCAT_BIN=$BIN/logcat_exit
+  echo "WIFI" > "$TRANSPORT_FILE"
+  start_daemon
+  w1=$(cat "$PID_FILE" 2>/dev/null)
+  start_daemon
+  w2=$(cat "$PID_FILE" 2>/dev/null)
+  [ -n "$w1" ] && [ "$w1" = "$w2" ] && ok "second start_daemon kept the same watcher" || no "duplicate daemon ($w1 -> $w2)"
+  lockpid=$(cat "$SUP_LOCK_DIR/pid" 2>/dev/null)
+  pid_alive "$lockpid" && ok "single supervisor holds the lock" || no "lock owner not alive ($lockpid)"
+  [ "$(cat "$SUP_LOCK_DIR/pid" 2>/dev/null)" = "$lockpid" ] && ok "lock owner unchanged after second start" || no "lock owner changed"
+  stop_daemon
   ;;
 esac
 

@@ -9,10 +9,16 @@ PATH="/system/bin:/system/xbin:/vendor/bin:${PATH:-/sbin:/su/bin}"
 export PATH
 
 MODDIR="${MODDIR:-/data/adb/modules/private_dns_auto_toggle}"
+# Directory the library itself lives in. Usually the same as MODDIR, but kept
+# separate so a launcher can source common.sh from a path other than the module
+# dir (the detached daemon re-sources this file).
+LIB_DIR="${LIB_DIR:-$MODDIR}"
 CONF_FILE="${CONF_FILE:-/data/adb/private_dns_auto_toggle.conf}"
 STATE_FILE="${STATE_FILE:-/data/adb/private_dns_auto_toggle.state}"
 FLAG_FILE="${FLAG_FILE:-/data/adb/private_dns_auto_toggle.vpn}"
 PID_FILE="${PID_FILE:-/data/adb/private_dns_auto_toggle.pid}"
+SUP_PID_FILE="${SUP_PID_FILE:-/data/adb/private_dns_auto_toggle.supervisor.pid}"
+SUP_LOCK_DIR="${SUP_LOCK_DIR:-/data/adb/private_dns_auto_toggle.supervisor.lock}"
 SAFETY_PID_FILE="${SAFETY_PID_FILE:-/data/adb/private_dns_auto_toggle.safety.pid}"
 LOGCAT_PID_FILE="${LOGCAT_PID_FILE:-/data/adb/private_dns_auto_toggle.logcat.pid}"
 HEARTBEAT_FILE="${HEARTBEAT_FILE:-/data/adb/private_dns_auto_toggle.heartbeat}"
@@ -26,12 +32,16 @@ LOG_FILE="${LOG_FILE:-/data/adb/private_dns_auto_toggle.log}"
 [ -x /system/bin/logcat ] && LOGCAT_BIN=/system/bin/logcat
 [ -x /system/bin/sleep ] && SLEEP_BIN=/system/bin/sleep
 [ -x /system/bin/mkfifo ] && MKFIFO_BIN=/system/bin/mkfifo
+[ -x /system/bin/setsid ] && SETSID_BIN=/system/bin/setsid
+[ -x /system/bin/sh ] && SHELL_PATH=/system/bin/sh
 SETTINGS_BIN="${SETTINGS_BIN:-settings}"
 GETPROP_BIN="${GETPROP_BIN:-getprop}"
 DUMPSYS_BIN="${DUMPSYS_BIN:-dumpsys}"
 LOGCAT_BIN="${LOGCAT_BIN:-logcat}"
 SLEEP_BIN="${SLEEP_BIN:-sleep}"
 MKFIFO_BIN="${MKFIFO_BIN:-mkfifo}"
+SETSID_BIN="${SETSID_BIN:-setsid}"
+SHELL_PATH="${SHELL_PATH:-/system/bin/sh}"
 SYSFS_NET="${SYSFS_NET:-/sys/class/net}"
 NETDEV_FILE="${NETDEV_FILE:-/proc/net/dev}"
 
@@ -431,11 +441,86 @@ watch_main() {
 }
 
 # Start the watcher in the background, killing any previous instance first.
+# The watcher is a plain child, which is enough when a supervisor is present (it
+# will resurrect it). The supervisor itself uses the detached path below, because
+# a child of service.sh does not survive Magisk reaping the service process on
+# some ROMs -- which is exactly why the toggle stopped after a VPN even though the
+# Action button worked.
 start_watcher() {
     stop_watcher
     ( watch_main ) >/dev/null 2>&1 &
     echo "$!" > "$PID_FILE"
     log_msg "Watcher started (pid=$(cat "$PID_FILE" 2>/dev/null), event_mode=$EVENT_MODE)"
+}
+
+# Run the supervisor loop itself. Called by the detached daemon below (and, in
+# tests, directly).
+daemon_main() {
+    # Single-instance guard: two daemons would both poll and fight. mkdir is
+    # atomic even on /data/adb, unlike a plain [ -f ] test-then-create over NFS-ish
+    # or FUSE-backed storage. A lock left by a crashed daemon is reclaimed when the
+    # recorded pid is not alive.
+    if ! mkdir "$SUP_LOCK_DIR" 2>/dev/null; then
+        if pid_alive "$(cat "$SUP_LOCK_DIR/pid" 2>/dev/null)"; then
+            return 0
+        fi
+        rm -rf "$SUP_LOCK_DIR"
+        mkdir "$SUP_LOCK_DIR" 2>/dev/null || return 0
+    fi
+    echo "$$" > "$SUP_LOCK_DIR/pid"
+    load_config
+    echo "$$" > "$SUP_PID_FILE"
+    start_watcher
+    supervise_watcher
+    rm -rf "$SUP_LOCK_DIR"
+}
+
+# Launch the supervisor loop as a detached daemon and return immediately. `( cmd
+# & )` reparents the command to init, and setsid detaches it from the caller's
+# session/process group so Magisk or the ROM cannot reap it when the launching
+# process (service.sh, or the Magisk app's shell) exits. Without the detach the
+# watcher would silently die and the toggle would only work via the Action button.
+start_daemon() {
+    # `( ... & )`: the background job is reparented to init when this subshell
+    # exits. setsid additionally detaches it from the caller's session, so the
+    # Magisk app's shell or a dying service.sh cannot take it down.
+    ( "$SETSID_BIN" "$SHELL_PATH" -c \
+        "MODDIR='$MODDIR' LIB_DIR='$LIB_DIR' . '$LIB_DIR/common.sh'; daemon_main" \
+        >/dev/null 2>&1 & )
+    "$SLEEP_BIN" 1
+    if ! pgrep_watcher; then
+        # setsid or a detached shell is not usable here (e.g. toybox without
+        # setsid): fall back to a plain backgrounded subshell.
+        ( daemon_main ) >/dev/null 2>&1 &
+        echo "$!" > "$SUP_PID_FILE"
+        "$SLEEP_BIN" 1
+    fi
+}
+
+# True when a process with the given pid is alive and not an unreaped zombie.
+pid_alive() {
+    local pid="$1"
+    [ -n "$pid" ] || return 1
+    [ -d "/proc/$pid" ] || return 1
+    [ "$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)" = Z ] && return 1
+    return 0
+}
+
+# True when either the supervisor or the watcher is alive. Used to decide
+# whether the daemon still needs to be (re)started.
+pgrep_watcher() {
+    pid_alive "$(cat "$SUP_PID_FILE" 2>/dev/null)" && return 0
+    pid_alive "$(cat "$PID_FILE" 2>/dev/null)" && return 0
+    return 1
+}
+
+# Bring the background daemon up unless it is already running. Safe to call from
+# anywhere: the Action button calls it so a tap repairs a dead watcher, and thus
+# also guarantees the disconnect restore keeps working afterwards.
+ensure_watcher() {
+    pgrep_watcher && return 0
+    log_msg "ensure_watcher: no live watcher; starting daemon"
+    start_daemon
 }
 
 # SIGKILL, not SIGTERM: mksh (Android's /system/bin/sh) does not terminate a
@@ -462,6 +547,19 @@ stop_watcher() {
     rm -f "$FIFO_FILE" "$HEARTBEAT_FILE"
 }
 
+# Stop the whole daemon: the supervisor loop as well as the watcher it owns.
+# Used by uninstall so nothing keeps toggling DNS after the module is gone.
+stop_daemon() {
+    local pid
+    if [ -f "$SUP_PID_FILE" ]; then
+        pid="$(cat "$SUP_PID_FILE" 2>/dev/null)"
+        [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
+        rm -f "$SUP_PID_FILE"
+    fi
+    rm -rf "$SUP_LOCK_DIR"
+    stop_watcher
+}
+
 # The watcher runs in the background and nothing in Android restarts it if it
 # dies (Magisk has no cron). A supervisor stays resident instead: it restarts the
 # watcher when its pid is gone and when the heartbeat is stale (a hung watcher).
@@ -472,6 +570,7 @@ supervise_watcher() {
         if [ ! -d "$MODDIR" ] || [ -f "$MODDIR/remove" ] || [ -f "$MODDIR/disable" ]; then
             log_msg "Supervisor: module disabled/removed; stopping"
             stop_watcher
+            rm -f "$SUP_PID_FILE"
             return 0
         fi
         stale=1
@@ -482,10 +581,7 @@ supervise_watcher() {
             [ $((now - hb)) -lt "$((POLL_INTERVAL * 3 + 60))" ] && stale=0
         fi
         pid="$(cat "$PID_FILE" 2>/dev/null)"
-        # A dead process can linger as a zombie until its parent reaps it, so a
-        # bare /proc check would still call it alive; read its state too.
-        if [ -z "$pid" ] || [ ! -d "/proc/$pid" ] \
-            || [ "$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)" = Z ] || [ "$stale" = 1 ]; then
+        if ! pid_alive "$pid" || [ "$stale" = 1 ]; then
             log_msg "Supervisor: watcher ${pid:-absent} gone or stale; restarting"
             start_watcher
         fi
@@ -507,7 +603,8 @@ diag_dump() {
     echo "settings binary : $SETTINGS_BIN [$([ -x "$SETTINGS_BIN" ] && echo ok || echo missing)]"
     echo "private_dns_mode: $(settings_get global private_dns_mode)"
     echo "specifier       : $(settings_get global private_dns_specifier)"
-    echo "watcher         : ${pid:-none} $(if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then echo alive; else echo dead; fi)"
+    echo "supervisor      : $(cat "$SUP_PID_FILE" 2>/dev/null || echo none) $(pid_alive "$(cat "$SUP_PID_FILE" 2>/dev/null)" && echo alive || echo dead)"
+    echo "watcher         : ${pid:-none} $(pid_alive "$pid" && echo alive || echo dead)"
     echo "state flag      : $([ -f "$FLAG_FILE" ] && echo set || echo unset)"
     if [ -f "$HEARTBEAT_FILE" ]; then
         echo "heartbeat       : $(cat "$HEARTBEAT_FILE" 2>/dev/null) (now $(date +%s))"
@@ -527,6 +624,9 @@ log_diag() {
 # detail to diagnose why nothing changes on a given device.
 run_once() {
     diag_dump
+    # A tap repairs the background watcher, so future connect/disconnect cycles are
+    # handled automatically even after the watcher died for any reason.
+    ensure_watcher
     if is_vpn_active; then
         echo "VPN: ACTIVE (${LAST_TRANSPORTS})"
         if disable_dns; then
