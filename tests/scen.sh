@@ -62,6 +62,23 @@ cat > "$BIN/logcat_exit" <<'EOF'
 for a in "$@"; do [ "$a" = "-d" ] && { echo probe; exit 0; }; done
 exit 0
 EOF
+# A slow dumpsys, as on a real device: each call costs seconds and is recorded so
+# a test can assert whether the toggle path paid for it at all.
+cat > "$BIN/dumpsys_slow" <<'EOF'
+#!/bin/sh
+[ -n "$DUMPSYS_MARK" ] && echo x >> "$DUMPSYS_MARK"
+/bin/sleep "${DUMPSYS_DELAY:-3}"
+if [ -n "$DUMPSYS_SEQ" ] && [ -f "$DUMPSYS_SEQ" ]; then
+  t=$(sed -n '1p' "$DUMPSYS_SEQ")
+else
+  t=$(cat "${PROBE_FILE:-$TRANSPORT_FILE}" 2>/dev/null)
+fi
+printf 'Current Networks:\n'
+case "$t" in
+  *VPN*) printf '  NetworkAgentInfo [VPN () - 101] {\n    Transports: VPN\n  }\n' ;;
+  *)     printf '  NetworkAgentInfo [WIFI () - 100] {\n    Transports: WIFI\n  }\n' ;;
+esac
+EOF
 chmod +x "$BIN"/*
 
 : > "$ROOT/netdev"
@@ -373,6 +390,33 @@ case "$N" in
   pid_alive "$lockpid" && ok "single supervisor holds the lock" || no "lock owner not alive ($lockpid)"
   [ "$(cat "$SUP_LOCK_DIR/pid" 2>/dev/null)" = "$lockpid" ] && ok "lock owner unchanged after second start" || no "lock owner changed"
   stop_daemon
+  ;;
+20)
+  # The reporting device's `dumpsys` is slow (seconds). Disable must not call it:
+  # the connect path is event-driven and asserts off immediately, so the toggle is
+  # instant regardless of how slow the probe is. Restore still happens.
+  export LOGCAT_BIN=$BIN/logcat
+  export DUMPSYS_BIN=$BIN/dumpsys_slow DUMPSYS_DELAY=3 DUMPSYS_MARK=$ROOT/dumpsys.calls
+  : > "$DUMPSYS_MARK"
+  echo "WIFI" > "$TRANSPORT_FILE"
+  # Let the one-off startup reconcile finish its slow dumpsys so we time only the
+  # event handling itself.
+  start_watcher; /bin/sleep 5
+  # The tunnel appears as tun0 (the cheap interface probe sees it; no dumpsys is
+  # needed on the event path). Assert on latency: the event must not wait for a
+  # slow dumpsys.
+  printf 'Inter-|   Receive\n face |bytes\n    lo: 1 1 0 0 0 0 0 0\n  tun0: 2 2 0 0 0 0 0 0\n' > "$NETDEV_FILE"
+  t0=$(date +%s)
+  echo "10-08 00:00:01.0  1  1 I Vpn     : setting state=CONNECTED, reason=establish" >> "$FEED_FILE"
+  wait_for "VPN active -> Private DNS disabled" 30 && ok "slow-dumpsys connect disabled" || { no "connect with slow dumpsys"; cat "$LOG_FILE"; }
+  dt=$(( $(date +%s) - t0 ))
+  [ "$dt" -le 1 ] && ok "disable was instant (${dt}s despite a ${DUMPSYS_DELAY}s dumpsys)" || no "disable took ${dt}s"
+  # Disconnect restores (tunnel really gone), and dumpsys is not consulted there either.
+  : > "$NETDEV_FILE"
+  echo "10-08 00:00:09.0  1  1 D Vpn     : setting state=DISCONNECTED, reason=agentDisconnect" >> "$FEED_FILE"
+  wait_for "VPN inactive -> Private DNS restored" 30 && ok "slow-dumpsys disconnect restored" || { no "restore with slow dumpsys"; cat "$LOG_FILE"; }
+  [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = hostname ] && ok "mode restored" || no "mode should be hostname"
+  stop_watcher
   ;;
 esac
 

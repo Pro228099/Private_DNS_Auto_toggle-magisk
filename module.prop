@@ -1,6 +1,6 @@
 id=private_dns_auto_toggle
 name=Private DNS Auto Toggle
-version=v1.1.8
-versionCode=11008
+version=v1.1.9
+versionCode=11009
 author=Pro228099
 description=Automatically turns Private DNS off while a VPN is active and restores it when the VPN disconnects. Config: /data/adb/private_dns_auto_toggle.conf

@@ -53,7 +53,7 @@ INTERVAL=5
 POLL_INTERVAL=30
 POLL_INTERVAL_ACTIVE=3
 CHECK_INTERVAL=10
-SETTLE=0
+SETTLE=1
 EVENT_WAIT=3
 EVENT_MODE=true
 AUTO_START=true
@@ -110,8 +110,16 @@ vpn_iface_name() {
 #   - a "NetworkAgentInfo [VPN" block or a "type: VPN" line is present.
 # The bare word "VPN" is never grepped, because every network prints "NOT_VPN"
 # among its capabilities.
-is_vpn_active() {
-    local iface dev dump transports active iface_seen=0
+is_vpn_active() { vpn_active "$1"; }
+
+# $1 = fast | full. The "full" check also runs `dumpsys connectivity`, which on a
+# real device can take several seconds. Detection of a proven-up interface (the
+# common exit for `up`) is cheap, but a *miss* always had to reach `dumpsys`
+# because a VPN can be up with no interface visible to us. The event path asks
+# for "fast" so it can settle quickly without paying that cost; the timer paths
+# keep "full" to stay exhaustive.
+vpn_active() {
+    local mode="$1" iface dev dump transports active iface_seen=0
 
     # 1a) sysfs: the interface's mere existence means a tunnel is up. operstate is
     #     ignored because some kernels report "unknown" for a working tunnel.
@@ -138,6 +146,13 @@ is_vpn_active() {
                 return 0
             fi
         done < "$NETDEV_FILE"
+    fi
+
+    if [ "$mode" = fast ]; then
+        # No tunnel interface visible. A log event already told us the state, so
+        # skip the slow `dumpsys` and report "not active" at face value.
+        LAST_TRANSPORTS="fast: no iface"
+        return 1
     fi
 
     dump="$("$DUMPSYS_BIN" connectivity 2>/dev/null)"
@@ -268,8 +283,12 @@ restore_dns() {
 # missed or duplicated event can never double-toggle. Callers pass a short label
 # for the log ("startup", "event", "poll").
 reconcile() {
+    local why="$1" force="$2"
     date +%s > "$HEARTBEAT_FILE" 2>/dev/null
-    if is_vpn_active; then
+    # A forced direction comes from a log event, which is authoritative and lets
+    # us skip the live probe entirely (the probe's `dumpsys` is what made the
+    # connect path slow). Timer paths pass no force and keep the full probe.
+    if [ "$force" = up ] || { [ -z "$force" ] && is_vpn_active; }; then
         # The flag means "this module is currently holding Private DNS off". Do
         # not trust it blindly: the user or the ROM can re-enable Private DNS
         # while the VPN stays up (that is exactly the "still doesn't turn off"
@@ -292,20 +311,18 @@ reconcile() {
         # Restore when either signal says we are holding the setting off: the flag
         # file (fast path) or the durable state marker (survives a lost flag).
         [ -f "$FLAG_FILE" ] || state_is_managed || return 0
-        # Guard against one flaky "no VPN" read flipping Private DNS back on while
-        # the tunnel is really still up: confirm once more before restoring. The
-        # event path (reconcile_event) has already waited for the probe to agree,
-        # so it can skip this debounce and restore immediately -- the debounce is
-        # only needed by the timer paths, where a single stray read is all we have.
-        case "$1" in
-            event:*) : ;;
-            *) "$SLEEP_BIN" 1 ;;
-        esac
-        if is_vpn_active; then
-            log_msg "VPN still active on recheck ($1; $LAST_TRANSPORTS); keeping Private DNS off"
-            return 0
+        # A timer path only has this one read, so guard against a flaky "no VPN"
+        # flipping Private DNS back on while the tunnel is really still up: confirm
+        # once more before restoring. A forced direction came from the log and has
+        # already been delayed by SETTLE in reconcile_event, so it restores as-is.
+        if [ -z "$force" ]; then
+            "$SLEEP_BIN" 1
+            if is_vpn_active; then
+                log_msg "VPN still active on recheck ($why; $LAST_TRANSPORTS); keeping Private DNS off"
+                return 0
+            fi
         fi
-        log_msg "VPN gone ($1; $LAST_TRANSPORTS)"
+        log_msg "VPN gone ($why; $LAST_TRANSPORTS)"
         restore_dns && { rm -f "$FLAG_FILE"; state_clear_managed; }
     fi
 }
@@ -321,30 +338,35 @@ vpn_event_dir() {
     esac
 }
 
-# Act on a log event. The line says which way the state is going, but the tunnel
-# interface appears/disappears about a second after it, so we first wait for the
-# live probe to agree (the ground truth). If it never agrees we still apply the
-# direction the log reported, so a DISCONNECT always restores Private DNS. Relying
-# on the probe alone here was the intermittent bug: at settle time the probe still
-# shows the old state, so the opposite action ran, or nothing did and Private DNS
-# was never restored.
+# Act on a log event. The event carries the direction, so it is authoritative and
+# drives the toggle; the interface probe is only consulted for the disconnect, to
+# avoid restoring before the tunnel really went away. Relying on the probe alone
+# was the intermittent bug (at settle time it still showed the old state).
 reconcile_event() {
-    local dir="$1" n=0 limit=$((SETTLE + EVENT_WAIT))
-    while [ "$n" -lt "$limit" ]; do
-        if [ "$dir" = up ]; then
-            is_vpn_active && { reconcile "event:$dir"; return 0; }
-        else
-            is_vpn_active || { reconcile "event:$dir"; return 0; }
-        fi
+    local dir="$1"
+
+    # The log line is the trigger and is authoritative, so no `dumpsys` probe is
+    # needed -- that probe is what used to make the connect take 10s+ (it ran on
+    # every iteration of the settle loop). Disable happens immediately.
+    #
+    # The disconnect is the one case that must not fire too early: several ROMs
+    # keep the tunnel interface for a moment after the log line, and restoring
+    # while the tunnel is still up leaves Private DNS on under a live VPN. So wait
+    # for the interface to actually disappear (a cheap check, no dumpsys), up to
+    # EVENT_WAIT seconds, and restore immediately once it is gone.
+    if [ "$dir" = up ]; then
+        reconcile "event:up" up
+        return 0
+    fi
+
+    local n=0
+    while [ "$n" -lt "$EVENT_WAIT" ]; do
+        vpn_active fast || break
         "$SLEEP_BIN" 1
         n=$((n + 1))
     done
-    log_msg "Event=$dir not confirmed by probe within ${limit}s; applying anyway ($LAST_TRANSPORTS)"
-    if [ "$dir" = up ]; then
-        disable_dns && { : > "$FLAG_FILE"; state_mark_managed; }
-    else
-        restore_dns && { rm -f "$FLAG_FILE"; state_clear_managed; }
-    fi
+    [ "$SETTLE" -gt 0 ] 2>/dev/null && "$SLEEP_BIN" "$SETTLE"
+    reconcile "event:down" down
 }
 
 # Event-driven watcher: follows the "Vpn" log tag so connect/disconnect are

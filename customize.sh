@@ -31,14 +31,22 @@ if [ -f /data/adb/private_dns_auto_toggle.conf ]; then
         } >> /data/adb/private_dns_auto_toggle.conf
         ui_print "- Config migrated: POLL_INTERVAL_ACTIVE / EVENT_WAIT added"
     fi
-    # v1.1.8 lowered the default latency knobs. Update them only when they still
-    # hold the old defaults, so a hand-tuned value is never overwritten.
+    # Latency knobs changed across releases. Move a config over only when it still
+    # holds a known release's defaults, so a hand-tuned value is never overwritten.
+    #   v1.1.7 defaults: SETTLE=1 EVENT_WAIT=4 POLL_INTERVAL_ACTIVE=5
+    #   v1.1.8 defaults: SETTLE=0 EVENT_WAIT=3 POLL_INTERVAL_ACTIVE=3
+    #   v1.1.9 defaults: SETTLE=1 EVENT_WAIT=3 POLL_INTERVAL_ACTIVE=3
     if grep -q '^SETTLE=1$' /data/adb/private_dns_auto_toggle.conf \
         && grep -q '^EVENT_WAIT=4$' /data/adb/private_dns_auto_toggle.conf \
         && grep -q '^POLL_INTERVAL_ACTIVE=5$' /data/adb/private_dns_auto_toggle.conf; then
-        sed -i 's/^SETTLE=1$/SETTLE=0/; s/^EVENT_WAIT=4$/EVENT_WAIT=3/; s/^POLL_INTERVAL_ACTIVE=5$/POLL_INTERVAL_ACTIVE=3/' \
+        sed -i 's/^EVENT_WAIT=4$/EVENT_WAIT=3/; s/^POLL_INTERVAL_ACTIVE=5$/POLL_INTERVAL_ACTIVE=3/' \
             /data/adb/private_dns_auto_toggle.conf
-        ui_print "- Config migrated: latency defaults lowered (SETTLE/EVENT_WAIT/POLL_INTERVAL_ACTIVE)"
+        ui_print "- Config migrated: latency defaults updated"
+    elif grep -q '^SETTLE=0$' /data/adb/private_dns_auto_toggle.conf \
+        && grep -q '^EVENT_WAIT=3$' /data/adb/private_dns_auto_toggle.conf \
+        && grep -q '^POLL_INTERVAL_ACTIVE=3$' /data/adb/private_dns_auto_toggle.conf; then
+        sed -i 's/^SETTLE=0$/SETTLE=1/' /data/adb/private_dns_auto_toggle.conf
+        ui_print "- Config migrated: restore delay set to 1s (disable stays instant)"
     fi
 fi
 
