@@ -439,6 +439,29 @@ case "$N" in
   [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = hostname ] && ok "mode restored" || no "mode should be hostname"
   stop_watcher
   ;;
+22)
+  # The regression that made v1.1.11 "not work at all": some VPNs expose no
+  # recognisable tunnel interface, so the interface watch alone saw nothing and
+  # the module waited for the old slow idle safety poll. With a dead log stream
+  # too, only the safety poll can catch it -- so it must run fast. Disable within
+  # a few seconds, not tens of seconds.
+  export LOGCAT_BIN=$BIN/logcat_exit
+  printf 'EVENT_MODE=true\nINTERVAL=5\nPOLL_INTERVAL=3\nPOLL_INTERVAL_ACTIVE=3\nIFACE_WATCH=1\nSETTLE=1\nEVENT_WAIT=3\nLOG=true\n' > "$ROOT/conf"
+  echo "WIFI" > "$TRANSPORT_FILE"
+  start_watcher; /bin/sleep 1
+  t0=$(date +%s)
+  # VPN up, visible ONLY via dumpsys: no tunnel interface, no log line.
+  echo "WIFI&VPN" > "$TRANSPORT_FILE"
+  wait_for "VPN active -> Private DNS disabled" 30 && ok "safety poll disabled without events" || { no "poll did not disable"; cat "$LOG_FILE"; }
+  dt=$(( $(date +%s) - t0 ))
+  [ "$dt" -le 12 ] && ok "disable within ${dt}s for a dumpsys-only VPN" || no "disable took ${dt}s"
+  [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = off ] && ok "mode off via safety poll" || no "mode should be off"
+  echo "WIFI" > "$TRANSPORT_FILE"
+  echo "10-08 00:00:09.0  1  1 D Vpn     : setting state=DISCONNECTED, reason=agentDisconnect" >> "$FEED_FILE"
+  wait_for "VPN inactive -> Private DNS restored" 30 && ok "restored after dumpsys-only VPN down" || { no "no restore"; cat "$LOG_FILE"; }
+  [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = hostname ] && ok "mode restored" || no "mode should be hostname"
+  stop_watcher
+  ;;
 esac
 
 echo "  scenario $N: $PASS passed, $FAIL failed"

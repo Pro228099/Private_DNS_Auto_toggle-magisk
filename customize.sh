@@ -40,6 +40,14 @@ if [ -f /data/adb/private_dns_auto_toggle.conf ]; then
             echo "IFACE_WATCH=1"
         } >> /data/adb/private_dns_auto_toggle.conf
         ui_print "- Config migrated: IFACE_WATCH added"
+        # The safety poll used to be a slow 30s. A pre-v1.1.11 config is therefore
+        # almost certainly still on that default, which left the module blind for up
+        # to half a minute for any VPN the interface watch cannot see. Lower it to
+        # the new default so the update actually takes effect without a reinstall.
+        if grep -q '^POLL_INTERVAL=30$' /data/adb/private_dns_auto_toggle.conf; then
+            sed -i 's/^POLL_INTERVAL=30$/POLL_INTERVAL=5/' /data/adb/private_dns_auto_toggle.conf
+            ui_print "- Config migrated: POLL_INTERVAL 30 -> 5 (faster catch)"
+        fi
     fi
     # Latency knobs changed across releases. Move a config over only when it still
     # holds a known release's defaults, so a hand-tuned value is never overwritten.

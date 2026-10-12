@@ -51,7 +51,7 @@ LAST_TRANSPORTS=""
 
 # Defaults (overridable from the config file).
 INTERVAL=5
-POLL_INTERVAL=30
+POLL_INTERVAL=5
 POLL_INTERVAL_ACTIVE=3
 IFACE_WATCH=1
 SUPERVISOR_INTERVAL=5
@@ -452,17 +452,16 @@ safety_loop() {
     done
 }
 
-# Fast interface watch. This is the "always ready" guarantee: it reads only the
-# interface list (a directory scan and /proc/net/dev -- no dumpsys, no settings
-# call) every IFACE_WATCH seconds, so a tunnel appearing is noticed within a
-# second or two even when the Vpn log stream is silent, buffered, or dead.
+# Fast interface watch. This is the "always ready" guarantee for the common case:
+# a VpnService always brings up a tunnel interface, so reading the interface list
+# (a directory scan and /proc/net/dev -- no dumpsys, no settings call) every
+# IFACE_WATCH seconds notices the tunnel within a second even when the Vpn log
+# stream is silent, buffered, or dead. It acts only on the connect transition and
+# forces the direction, since the visible interface already proves the VPN is up.
 #
-# It only acts on the connect transition (tunnel present, flag not set) and forces
-# the direction, since the visible interface already proves the VPN is up. That
-# keeps the whole loop to an interface scan per second and makes disabling
-# instant, with no dumpsys in the path. Everything else -- restore, and
-# re-asserting after the user re-enables Private DNS while the VPN is up -- is
-# left to the event/safety paths, so this loop never fights them.
+# VPNs with no recognisable interface (unusual, but real) are left to the safety
+# poll, which now runs fast enough (POLL_INTERVAL) to catch them within a few
+# seconds rather than the old half minute.
 iface_loop() {
     while [ -p "$FIFO_FILE" ]; do
         "$SLEEP_BIN" "$IFACE_WATCH"
