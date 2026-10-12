@@ -20,6 +20,7 @@ PID_FILE="${PID_FILE:-/data/adb/private_dns_auto_toggle.pid}"
 SUP_PID_FILE="${SUP_PID_FILE:-/data/adb/private_dns_auto_toggle.supervisor.pid}"
 SUP_LOCK_DIR="${SUP_LOCK_DIR:-/data/adb/private_dns_auto_toggle.supervisor.lock}"
 SAFETY_PID_FILE="${SAFETY_PID_FILE:-/data/adb/private_dns_auto_toggle.safety.pid}"
+IFACE_PID_FILE="${IFACE_PID_FILE:-/data/adb/private_dns_auto_toggle.iface.pid}"
 LOGCAT_PID_FILE="${LOGCAT_PID_FILE:-/data/adb/private_dns_auto_toggle.logcat.pid}"
 HEARTBEAT_FILE="${HEARTBEAT_FILE:-/data/adb/private_dns_auto_toggle.heartbeat}"
 FIFO_FILE="${FIFO_FILE:-/data/adb/private_dns_auto_toggle.fifo}"
@@ -52,6 +53,8 @@ LAST_TRANSPORTS=""
 INTERVAL=5
 POLL_INTERVAL=30
 POLL_INTERVAL_ACTIVE=3
+IFACE_WATCH=1
+SUPERVISOR_INTERVAL=5
 CHECK_INTERVAL=10
 SETTLE=1
 EVENT_WAIT=3
@@ -400,10 +403,14 @@ event_loop() {
         poll_loop
         return
     }
-    log_msg "Event mode: watching 'logcat -s Vpn' (safety poll every ${POLL_INTERVAL}s)"
+    log_msg "Event mode: watching 'logcat -s Vpn' (safety poll every ${POLL_INTERVAL}s, iface watch every ${IFACE_WATCH}s)"
 
     ( safety_loop ) >/dev/null 2>&1 &
     echo "$!" > "$SAFETY_PID_FILE"
+    # Independent, cheap tunnel watch: keeps the module working even if the log
+    # stream never delivers a Vpn line (block-buffered on Android <= 12, or dead).
+    ( iface_loop ) >/dev/null 2>&1 &
+    echo "$!" > "$IFACE_PID_FILE"
 
     # Restart the stream if logcat ever exits (logd restart, toybox hiccup).
     while true; do
@@ -420,8 +427,8 @@ event_loop() {
         kill -9 "$lpid" 2>/dev/null
         wait "$lpid" 2>/dev/null
         rm -f "$LOGCAT_PID_FILE"
-        log_msg "Event stream ended; retrying in ${POLL_INTERVAL}s"
-        "$SLEEP_BIN" "$POLL_INTERVAL"
+        log_msg "Event stream ended; retrying in ${SUPERVISOR_INTERVAL}s"
+        "$SLEEP_BIN" "$SUPERVISOR_INTERVAL"
     done
 }
 
@@ -442,6 +449,27 @@ safety_loop() {
         "$SLEEP_BIN" "$wait"
         [ -p "$FIFO_FILE" ] || break
         reconcile "safety"
+    done
+}
+
+# Fast interface watch. This is the "always ready" guarantee: it reads only the
+# interface list (a directory scan and /proc/net/dev -- no dumpsys, no settings
+# call) every IFACE_WATCH seconds, so a tunnel appearing is noticed within a
+# second or two even when the Vpn log stream is silent, buffered, or dead.
+#
+# It only acts on the connect transition (tunnel present, flag not set) and forces
+# the direction, since the visible interface already proves the VPN is up. That
+# keeps the whole loop to an interface scan per second and makes disabling
+# instant, with no dumpsys in the path. Everything else -- restore, and
+# re-asserting after the user re-enables Private DNS while the VPN is up -- is
+# left to the event/safety paths, so this loop never fights them.
+iface_loop() {
+    while [ -p "$FIFO_FILE" ]; do
+        "$SLEEP_BIN" "$IFACE_WATCH"
+        [ -p "$FIFO_FILE" ] || break
+        [ -f "$FLAG_FILE" ] && continue
+        vpn_active fast || continue
+        reconcile "iface" up
     done
 }
 
@@ -567,6 +595,11 @@ stop_watcher() {
         [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
         rm -f "$SAFETY_PID_FILE"
     fi
+    if [ -f "$IFACE_PID_FILE" ]; then
+        pid="$(cat "$IFACE_PID_FILE" 2>/dev/null)"
+        [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
+        rm -f "$IFACE_PID_FILE"
+    fi
     if [ -f "$PID_FILE" ]; then
         pid="$(cat "$PID_FILE" 2>/dev/null)"
         [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
@@ -613,7 +646,7 @@ supervise_watcher() {
             log_msg "Supervisor: watcher ${pid:-absent} gone or stale; restarting"
             start_watcher
         fi
-        "$SLEEP_BIN" "$POLL_INTERVAL"
+        "$SLEEP_BIN" "$SUPERVISOR_INTERVAL"
     done
 }
 
@@ -633,6 +666,7 @@ diag_dump() {
     echo "specifier       : $(settings_get global private_dns_specifier)"
     echo "supervisor      : $(cat "$SUP_PID_FILE" 2>/dev/null || echo none) $(pid_alive "$(cat "$SUP_PID_FILE" 2>/dev/null)" && echo alive || echo dead)"
     echo "watcher         : ${pid:-none} $(pid_alive "$pid" && echo alive || echo dead)"
+    echo "iface watch     : $(cat "$IFACE_PID_FILE" 2>/dev/null || echo none) $(pid_alive "$(cat "$IFACE_PID_FILE" 2>/dev/null)" && echo alive || echo dead)"
     echo "state flag      : $([ -f "$FLAG_FILE" ] && echo set || echo unset)"
     if [ -f "$HEARTBEAT_FILE" ]; then
         echo "heartbeat       : $(cat "$HEARTBEAT_FILE" 2>/dev/null) (now $(date +%s))"

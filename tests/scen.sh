@@ -95,7 +95,7 @@ elif [ "$N" = 10 ] || [ "$N" = 11 ]; then
 elif [ "$N" = 12 ]; then
   printf 'EVENT_MODE=true\nINTERVAL=5\nPOLL_INTERVAL=2\nSETTLE=0\nLOG=true\n' > "$ROOT/conf"
 elif [ "$N" = 13 ]; then
-  printf 'EVENT_MODE=true\nINTERVAL=5\nPOLL_INTERVAL=1\nPOLL_INTERVAL_ACTIVE=1\nSETTLE=0\nLOG=true\n' > "$ROOT/conf"
+  printf 'EVENT_MODE=true\nINTERVAL=5\nPOLL_INTERVAL=1\nPOLL_INTERVAL_ACTIVE=1\nSUPERVISOR_INTERVAL=1\nSETTLE=0\nLOG=true\n' > "$ROOT/conf"
 else
   case "$N" in
     1|4|5|7) POLL=15 ;;
@@ -112,7 +112,7 @@ export SETTINGS_BIN=$BIN/settings DUMPSYS_BIN=$BIN/dumpsys LOGCAT_BIN=$BIN/logca
 export SLEEP_BIN=/bin/sleep MKFIFO_BIN=/usr/bin/mkfifo SYSFS_NET=$ROOT/net NETDEV_FILE=$ROOT/netdev
 export DUMPSYS_SEQ=$ROOT/seq
 export CONF_FILE=$ROOT/conf STATE_FILE=$ROOT/state FLAG_FILE=$ROOT/vpn.flag
-export PID_FILE=$ROOT/pid SUP_PID_FILE=$ROOT/sup.pid SUP_LOCK_DIR=$ROOT/sup.lock LOGCAT_PID_FILE=$ROOT/logcat.pid SAFETY_PID_FILE=$ROOT/safety.pid
+export PID_FILE=$ROOT/pid SUP_PID_FILE=$ROOT/sup.pid SUP_LOCK_DIR=$ROOT/sup.lock LOGCAT_PID_FILE=$ROOT/logcat.pid SAFETY_PID_FILE=$ROOT/safety.pid IFACE_PID_FILE=$ROOT/iface.pid
 export FIFO_FILE=$ROOT/fifo LOG_FILE=$ROOT/log HEARTBEAT_FILE=$ROOT/heartbeat
 export MODDIR=$ROOT/mod
 # The daemon re-sources common.sh from LIB_DIR; in tests that is the real module
@@ -415,6 +415,27 @@ case "$N" in
   : > "$NETDEV_FILE"
   echo "10-08 00:00:09.0  1  1 D Vpn     : setting state=DISCONNECTED, reason=agentDisconnect" >> "$FEED_FILE"
   wait_for "VPN inactive -> Private DNS restored" 30 && ok "slow-dumpsys disconnect restored" || { no "restore with slow dumpsys"; cat "$LOG_FILE"; }
+  [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = hostname ] && ok "mode restored" || no "mode should be hostname"
+  stop_watcher
+  ;;
+21)
+  # The reported failure: the module did not react for half a minute because the
+  # log stream delivered nothing and the idle safety poll was slow. The interface
+  # watch must catch a tunnel on its own, with a dead logcat AND a slow safety
+  # poll, within a couple of seconds.
+  export LOGCAT_BIN=$BIN/logcat_exit
+  printf 'EVENT_MODE=true\nINTERVAL=5\nPOLL_INTERVAL=60\nPOLL_INTERVAL_ACTIVE=3\nIFACE_WATCH=1\nSETTLE=1\nEVENT_WAIT=3\nLOG=true\n' > "$ROOT/conf"
+  echo "WIFI" > "$TRANSPORT_FILE"
+  start_watcher; /bin/sleep 1
+  t0=$(date +%s)
+  printf 'Inter-|   Receive\n face |bytes\n    lo: 100 1 0 0 0 0 0 0\n  tun0: 200 2 0 0 0 0 0 0\n' > "$NETDEV_FILE"
+  wait_for "VPN active -> Private DNS disabled" 30 && ok "iface watch disabled without events" || { no "iface watch did not disable"; cat "$LOG_FILE"; }
+  dt=$(( $(date +%s) - t0 ))
+  [ "$dt" -le 3 ] && ok "disable within ${dt}s with dead log and 60s poll" || no "disable took ${dt}s"
+  [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = off ] && ok "mode off via iface watch" || no "mode should be off"
+  : > "$NETDEV_FILE"
+  echo "10-08 00:00:09.0  1  1 D Vpn     : setting state=DISCONNECTED, reason=agentDisconnect" >> "$FEED_FILE"
+  wait_for "VPN inactive -> Private DNS restored" 30 && ok "restored after iface down" || { no "no restore"; cat "$LOG_FILE"; }
   [ "$(cat "$SETTINGS_DIR/global.private_dns_mode")" = hostname ] && ok "mode restored" || no "mode should be hostname"
   stop_watcher
   ;;

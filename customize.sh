@@ -31,6 +31,16 @@ if [ -f /data/adb/private_dns_auto_toggle.conf ]; then
         } >> /data/adb/private_dns_auto_toggle.conf
         ui_print "- Config migrated: POLL_INTERVAL_ACTIVE / EVENT_WAIT added"
     fi
+    if ! grep -q '^IFACE_WATCH=' /data/adb/private_dns_auto_toggle.conf; then
+        {
+            echo ""
+            echo "# Added in v1.1.11"
+            echo "# Interface-watch interval in seconds: a tiny loop (no dumpsys) that"
+            echo "# notices a tunnel appearing even if the Vpn log stream is silent or dead."
+            echo "IFACE_WATCH=1"
+        } >> /data/adb/private_dns_auto_toggle.conf
+        ui_print "- Config migrated: IFACE_WATCH added"
+    fi
     # Latency knobs changed across releases. Move a config over only when it still
     # holds a known release's defaults, so a hand-tuned value is never overwritten.
     #   v1.1.7 defaults: SETTLE=1 EVENT_WAIT=4 POLL_INTERVAL_ACTIVE=5
