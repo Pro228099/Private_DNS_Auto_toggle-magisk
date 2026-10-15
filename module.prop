@@ -1,6 +1,7 @@
 id=private_dns_auto_toggle
 name=Private DNS Auto Toggle
-version=v1.1.12
-versionCode=11012
+version=v1.1.13
+versionCode=11013
 author=Pro228099
 description=Automatically turns Private DNS off while a VPN is active and restores it when the VPN disconnects. Config: /data/adb/private_dns_auto_toggle.conf
+updateJson=https://cdn.jsdelivr.net/gh/Pro228099/Private_DNS_Auto_toggle-magisk@main/update.json
